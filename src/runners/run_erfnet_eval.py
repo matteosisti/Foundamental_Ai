@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from torchvision.transforms import Compose, Resize, ToTensor
 
-from src.models.erfnet import ERFNet
+from eval.erfnet import ERFNet
 from ood_metrics import fpr_at_95_tpr
 from sklearn.metrics import average_precision_score
 

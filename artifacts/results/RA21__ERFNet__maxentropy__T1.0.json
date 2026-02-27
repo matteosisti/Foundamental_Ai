@@ -1,0 +1,13 @@
+{
+  "model": "ERFNet",
+  "dataset": "RA21",
+  "method": "maxentropy",
+  "temperature": 1.0,
+  "auprc": 0.14871650043475582,
+  "fpr95": 0.9461696406065209,
+  "auprc_pct": 14.871650043475581,
+  "fpr95_pct": 94.61696406065208,
+  "images_used": 10,
+  "input_glob": "/content/drive/MyDrive/anom_project/Validation_Dataset/RoadAnomaly21/images/*.*",
+  "weights": "trained_models/erfnet_pretrained.pth"
+}

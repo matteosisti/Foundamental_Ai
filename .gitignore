@@ -1,2 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 
-*.npy
+# Envs
+.venv/
+venv/
+env/
+conda/
+*.egg-info/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Notebooks / colab junk
+.ipynb_checkpoints/
+*.ipynb

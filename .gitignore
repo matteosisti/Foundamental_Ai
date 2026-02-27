@@ -1,0 +1,21 @@
+# datasets / checkpoints / cache
+data/
+Validation_Dataset/
+cache_logits/
+ckpts/
+*.zip
+*.tar
+*.tar.gz
+*.pth
+*.pt
+*.bin
+
+# python junk
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# logs/results
+eval/results.txt
+*.log
+EOF

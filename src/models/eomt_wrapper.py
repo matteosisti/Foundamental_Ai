@@ -1,19 +1,43 @@
 
 import re
-from typing import Dict, Any, Tuple, Optional
+import sys
+import importlib
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
 
 
+def _alias_eomt_subpackages():
+	"""
+	EoMT code inside this course repo sometimes uses broken absolute imports:
+		from models.xxx import ...
+	instead of:
+		from eomt.models.xxx import ...
+
+	We avoid editing professor files by aliasing:
+		models -> eomt.models
+		datasets -> eomt.datasets (if needed)
+		utils -> eomt.utils (if needed)
+	"""
+	aliases = {
+		"models": "eomt.models",
+		"datasets": "eomt.datasets",
+		"utils": "eomt.utils",
+	}
+
+	for src_name, target_name in aliases.items():
+		if src_name in sys.modules:
+			continue
+		try:
+			mod = importlib.import_module(target_name)
+			sys.modules[src_name] = mod
+		except Exception:
+			# not all targets exist; ignore silently
+			pass
+
+
 def _clean_state_dict_keys(state: Dict[str, torch.Tensor], allowed_prefixes=("network.", "model.", "module.")) -> Dict[str, torch.Tensor]:
-	"""
-	Try to normalize checkpoint keys to match the bare EoMT network keys.
-	This supports common wrappers:
-	- Lightning: state_dict with "network."
-	- DataParallel: "module."
-	- custom: "model."
-	"""
 	# If it's a Lightning checkpoint, sometimes it's {"state_dict": {...}}
 	if "state_dict" in state and isinstance(state["state_dict"], dict):
 		state = state["state_dict"]
@@ -34,10 +58,6 @@ def _clean_state_dict_keys(state: Dict[str, torch.Tensor], allowed_prefixes=("ne
 
 
 def _load_weights_fuzzy(model: nn.Module, ckpt_path: str, device: torch.device) -> None:
-	"""
-	Load a checkpoint with best-effort key matching (strict=False),
-	and also tries to handle common key-prefix differences.
-	"""
 	raw = torch.load(ckpt_path, map_location="cpu")
 	state = _clean_state_dict_keys(raw)
 
@@ -48,7 +68,6 @@ def _load_weights_fuzzy(model: nn.Module, ckpt_path: str, device: torch.device) 
 		if k in own and own[k].shape == v.shape:
 			loadable[k] = v
 
-	# fallback: try removing "encoder." / "network." kinds of mismatches if needed
 	if len(loadable) == 0:
 		for k, v in state.items():
 			k2 = re.sub(r"^eomt\.", "", k)
@@ -57,25 +76,18 @@ def _load_weights_fuzzy(model: nn.Module, ckpt_path: str, device: torch.device) 
 
 	missing, unexpected = model.load_state_dict(loadable, strict=False)
 
-	# Move to device after loading
 	model.to(device)
 	model.eval()
 
-	# Helpful prints
 	print(f"[EoMT] Loaded weights from: {ckpt_path}")
 	print(f"[EoMT] loadable keys: {len(loadable)} / model keys: {len(own)}")
 	if len(missing) > 0:
-		print(f"[EoMT] missing (showing up to 20): {missing[:20]}")
+		print(f"[EoMT] missing (up to 20): {missing[:20]}")
 	if len(unexpected) > 0:
-		print(f"[EoMT] unexpected (showing up to 20): {unexpected[:20]}")
+		print(f"[EoMT] unexpected (up to 20): {unexpected[:20]}")
 
 
 class EoMTWrapper(nn.Module):
-	"""
-	Thin wrapper around the professor EoMT code.
-	Assumes eomt/ package is available in PYTHONPATH (repo root in sys.path).
-	"""
-
 	def __init__(
 		self,
 		num_classes: int = 19,
@@ -86,7 +98,10 @@ class EoMTWrapper(nn.Module):
 	):
 		super().__init__()
 
-		# Import from the provided EoMT package
+		# 🔧 fix broken absolute imports inside EoMT code
+		_alias_eomt_subpackages()
+
+		# Now imports should work even if EoMT used "from models..."
 		from eomt.models.vit import ViT
 		from eomt.models.eomt import EoMT
 
@@ -104,11 +119,6 @@ class EoMTWrapper(nn.Module):
 
 	@torch.no_grad()
 	def forward_masks_and_classes(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-		"""
-		Returns last-layer (mask_logits, class_logits)
-		mask_logits: [B,Q,H,W]
-		class_logits: [B,Q,C(+1)]
-		"""
 		mask_list, class_list = self.net(x)
 		mask_logits = mask_list[-1]
 		class_logits = class_list[-1]

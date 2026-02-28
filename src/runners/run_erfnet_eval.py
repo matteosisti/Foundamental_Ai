@@ -1,3 +1,7 @@
+# =========================
+# File: scripts/erfnet_eval.py
+# Full rewrite + --prof-exact mode
+# =========================
 import os
 import glob
 import json
@@ -13,11 +17,17 @@ import torch.nn.functional as F
 from torchvision.transforms import Compose, Resize, ToTensor
 
 from eval.erfnet import ERFNet
-from ood_metrics import fpr_at_95_tpr
 from sklearn.metrics import average_precision_score
+
+# Robust import: works whether you run from repo root or as package
+try:
+	from src.utils.ood_metrics import fpr_at_95_tpr
+except Exception:
+	from ood_metrics import fpr_at_95_tpr  # fallback
 
 NUM_CLASSES = 20
 
+# Default resize chosen by your code (keep it stable)
 input_transform = Compose([
 	Resize((512, 1024), Image.BILINEAR),
 	ToTensor(),
@@ -29,6 +39,10 @@ target_transform = Compose([
 
 
 def load_erfnet(weights_path: str, device: torch.device) -> torch.nn.Module:
+	"""
+	Load ERFNet with a robust state_dict merge (handles module. prefixes).
+	Prints load stats to diagnose partial loads (common mismatch source).
+	"""
 	model = ERFNet(NUM_CLASSES)
 
 	if device.type == "cuda":
@@ -37,16 +51,24 @@ def load_erfnet(weights_path: str, device: torch.device) -> torch.nn.Module:
 		model = model.cpu()
 
 	state = torch.load(weights_path, map_location="cpu")
+	# If checkpoint is nested (rare), unwrap
+	if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+		state = state["state_dict"]
+
 	own = model.state_dict()
 
-	# robust load: handles keys with/without "module."
+	loadable = 0
 	for k, v in state.items():
 		k2 = k.replace("module.", "")
-		if k2 in own and own[k2].shape == v.shape:
+		if k2 in own and hasattr(v, "shape") and own[k2].shape == v.shape:
 			own[k2].copy_(v)
+			loadable += 1
 
 	model.load_state_dict(own, strict=False)
 	model.eval()
+
+	print(f"[ERFNet] Loaded weights: {weights_path}")
+	print(f"[ERFNet] loadable keys: {loadable} / model keys: {len(own)}")
 	return model
 
 
@@ -113,6 +135,27 @@ def anomaly_from_logits(logits: torch.Tensor, method: str, T: float) -> np.ndarr
 	raise ValueError(f"Unknown method: {method}")
 
 
+def anomaly_prof_exact(result: torch.Tensor) -> np.ndarray:
+	"""
+	Professor baseline (as seen in evalAnomaly.py-like scripts):
+	anomaly = 1 - max(result, axis=0), WITHOUT softmax.
+	result is assumed to be [1, C, H, W] or [C, H, W] compatible.
+
+	Returns [H,W] float32 numpy.
+	"""
+	if result.dim() == 4:
+		r = result.squeeze(0)
+	elif result.dim() == 3:
+		r = result
+	else:
+		raise ValueError(f"Unexpected ERFNet output shape: {tuple(result.shape)}")
+
+	# raw max over channels
+	m = torch.max(r, dim=0).values  # [H,W]
+	anomaly = 1.0 - m
+	return anomaly.detach().cpu().float().numpy()
+
+
 def ensure_artifact_dirs(root: Path) -> dict:
 	dirs = {
 		"root": root,
@@ -147,8 +190,24 @@ def main():
 	ap.add_argument("--input", required=True, help="Glob, es: /path/images/*.*")
 	ap.add_argument("--weights", required=True, help="Path .pth ERFNet")
 	ap.add_argument("--cpu", action="store_true")
+
+	# Our methods (softmax-based)
 	ap.add_argument("--method", choices=["msp", "maxlogit", "maxentropy"], default="msp")
 	ap.add_argument("--temperature", type=float, default=1.0)
+
+	# Professor-identical mode
+	ap.add_argument(
+		"--prof-exact",
+		action="store_true",
+		help="Replica baseline professor: anomaly = 1 - max(raw_output) (no softmax). "
+			 "Also offers --prof-permute-bug to mimic broken tensor permute if needed."
+	)
+	ap.add_argument(
+		"--prof-permute-bug",
+		action="store_true",
+		help="Bug-compatible: apply x = x.permute(0,3,1,2) AFTER ToTensor(). "
+			 "Use only if you must match professor numbers exactly."
+	)
 
 	# Saving / artifacts
 	ap.add_argument("--dataset-name", default="dataset", help="Name used in saved artifacts filenames")
@@ -158,7 +217,7 @@ def main():
 
 	args = ap.parse_args()
 
-	device = torch.device("cpu" if args.cpu else "cuda")
+	device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 	model = load_erfnet(args.weights, device)
 
 	paths = sorted(glob.glob(os.path.expanduser(args.input)))
@@ -183,33 +242,53 @@ def main():
 			print(f"[SKIP] GT error {path}: {e}")
 			continue
 
-		# if no anomaly pixel, skip (same logic as original)
+		# If no anomaly pixel, skip (same logic as original)
 		if 1 not in np.unique(ood):
 			continue
 
 		img = Image.open(path).convert("RGB")
-		x = input_transform(img).unsqueeze(0).float().to(device)
+		x = input_transform(img).unsqueeze(0).float().to(device)  # [1,3,H,W]
 
-		logits = model(x)  # [1,C,H,W]
+		# Bug-compatible hook (ONLY if needed)
+		if args.prof_exact and args.prof_permute_bug:
+			# This is intentionally wrong for ToTensor output, but may match professor baseline behavior.
+			x = x.permute(0, 3, 1, 2)
+
+		out = model(x)  # expected [1,C,H,W] in our pipeline
 
 		# Save logits/gt for temperature scaling (only once, then reuse)
+		# For prof_exact, we still cache raw outputs (same tensor) for later analysis.
 		if args.save_logits:
-			logits_cache.append(logits.squeeze(0).detach().cpu().numpy().astype(np.float32))
+			if out.dim() == 4:
+				logits_cache.append(out.squeeze(0).detach().cpu().numpy().astype(np.float32))
+			elif out.dim() == 3:
+				logits_cache.append(out.detach().cpu().numpy().astype(np.float32))
+			else:
+				raise ValueError(f"Unexpected ERFNet output shape for caching: {tuple(out.shape)}")
 			gt_cache.append(ood.astype(np.uint8))
 			img_names.append(os.path.basename(path))
 
-		anomaly = anomaly_from_logits(logits, args.method, args.temperature)
+		# Compute anomaly
+		if args.prof_exact:
+			anomaly = anomaly_prof_exact(out)
+			method_name = "prof_exact"
+			T_used = None
+		else:
+			anomaly = anomaly_from_logits(out, args.method, args.temperature)
+			method_name = args.method
+			T_used = args.temperature
 
 		ood_list.append(ood)
 		anomaly_list.append(anomaly)
 
 		if args.save_anomaly_maps:
-			out_map = art_dirs["anomaly_maps"] / f"{args.dataset_name}__{args.method}__T{args.temperature}__{os.path.basename(path)}.npy"
+			T_tag = "NA" if T_used is None else f"{T_used}"
+			out_map = art_dirs["anomaly_maps"] / f"{args.dataset_name}__{method_name}__T{T_tag}__{os.path.basename(path)}.npy"
 			np.save(out_map, anomaly.astype(np.float32))
 
 	# Safety
 	if len(ood_list) == 0:
-		raise RuntimeError("Nessuna immagine valida trovata (tutte skip o senza pixel OOD).")
+		raise RuntimeError("No valid images found (all skipped or without OOD pixels).")
 
 	ood_gts = np.array(ood_list)
 	anomaly_scores = np.array(anomaly_list)
@@ -228,7 +307,10 @@ def main():
 
 	# Print
 	print("=====================================")
-	print(f"ERFNet | dataset={args.dataset_name} | method={args.method} | T={args.temperature}")
+	if args.prof_exact:
+		print(f"ERFNet | dataset={args.dataset_name} | method=prof_exact | T=NA | permute_bug={args.prof_permute_bug}")
+	else:
+		print(f"ERFNet | dataset={args.dataset_name} | method={args.method} | T={args.temperature}")
 	print(f"AUPRC: {auprc*100.0:.4f}")
 	print(f"FPR@95TPR: {fpr95*100.0:.4f}")
 	print(f"Images used: {len(ood_list)}")
@@ -238,8 +320,8 @@ def main():
 	metrics = {
 		"model": "ERFNet",
 		"dataset": args.dataset_name,
-		"method": args.method,
-		"temperature": float(args.temperature),
+		"method": ("prof_exact" if args.prof_exact else args.method),
+		"temperature": (None if args.prof_exact else float(args.temperature)),
 		"auprc": float(auprc),
 		"fpr95": float(fpr95),
 		"auprc_pct": float(auprc * 100.0),
@@ -247,9 +329,13 @@ def main():
 		"images_used": int(len(ood_list)),
 		"input_glob": args.input,
 		"weights": args.weights,
+		"prof_permute_bug": bool(args.prof_permute_bug) if args.prof_exact else False,
 	}
 
-	json_path = art_dirs["results"] / f"{args.dataset_name}__ERFNet__{args.method}__T{args.temperature}.json"
+	T_tag = "NA" if args.prof_exact else str(args.temperature)
+	method_tag = "prof_exact" if args.prof_exact else args.method
+
+	json_path = art_dirs["results"] / f"{args.dataset_name}__ERFNet__{method_tag}__T{T_tag}.json"
 	with open(json_path, "w") as f:
 		json.dump(metrics, f, indent=2)
 	print(f"[SAVED] {json_path}")

@@ -90,6 +90,7 @@ def _load_weights_fuzzy(model: nn.Module, ckpt_path: str, device: torch.device) 
 class EoMTWrapper(nn.Module):
 	def __init__(
 		self,
+		img_size: Tuple[int, int], 
 		num_classes: int = 19,
 		num_q: int = 100,
 		num_blocks: int = 3,
@@ -98,14 +99,14 @@ class EoMTWrapper(nn.Module):
 	):
 		super().__init__()
 
-		# 🔧 fix broken absolute imports inside EoMT code
+		#  fix broken absolute imports inside EoMT code
 		_alias_eomt_subpackages()
 
 		# Now imports should work even if EoMT used "from models..."
 		from eomt.models.vit import ViT
 		from eomt.models.eomt import EoMT
 
-		encoder = ViT(backbone_name=backbone_name)
+		encoder = ViT(img_size=img_size, backbone_name=backbone_name)
 		self.net = EoMT(
 			encoder=encoder,
 			num_classes=num_classes,
@@ -120,6 +121,7 @@ class EoMTWrapper(nn.Module):
 	@torch.no_grad()
 	def forward_masks_and_classes(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 		mask_list, class_list = self.net(x)
+		# We took last layer decoder outputs
 		mask_logits = mask_list[-1]
 		class_logits = class_list[-1]
 		return mask_logits, class_logits

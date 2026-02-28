@@ -1,8 +1,7 @@
 import re
 import sys
 import importlib
-from pathlib import Path
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -10,9 +9,13 @@ import torch.nn as nn
 
 def _alias_eomt_subpackages():
     """
-    Fix broken absolute imports within the course EoMT codebase.
-    Some files use 'from models.xxx import ...' instead of 'from eomt.models.xxx'.
-    This creates runtime aliases to avoid modifying original source files:
+    Fix broken absolute imports within the EoMT repository.
+    Original course files often use:
+        from models.xxx import ...
+    instead of the correct:
+        from eomt.models.xxx import ...
+
+    To avoid patching original source files, we create runtime aliases:
         models   -> eomt.models
         datasets -> eomt.datasets
         utils    -> eomt.utils
@@ -30,88 +33,65 @@ def _alias_eomt_subpackages():
             mod = importlib.import_module(target_name)
             sys.modules[src_name] = mod
         except Exception:
-            # Silently ignore if the target package doesn't exist
+            # Silently skip if subpackage is missing
             pass
 
 
-def _safe_read_yaml(path: str) -> Dict[str, Any]:
-    """Reads a YAML configuration file safely using PyYAML."""
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Config not found: {path}")
-
-    try:
-        import yaml
-    except Exception as e:
-        raise ImportError("Missing dependency: PyYAML. Install it with `pip install pyyaml`.") from e
-
-    with open(p, "r", encoding="utf-8") as f:
-        obj = yaml.safe_load(f)
-    if not isinstance(obj, dict):
-        raise ValueError(f"Invalid YAML structure in {path}")
-    return obj
-
-
-def _yaml_get(d: Dict[str, Any], keys: Tuple[str, ...], default=None):
-    """Deep-get helper for nested dictionaries."""
-    cur: Any = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
-
-
-def _clean_state_dict_keys(state: Dict[str, Any], allowed_prefixes=("network.", "model.", "module.")) -> Dict[str, torch.Tensor]:
+def _unwrap_state_dict(raw: Dict) -> Dict[str, torch.Tensor]:
     """
-    Standardizes state_dict keys by stripping common prefixes (e.g., from Lightning or DataParallel).
-    Iteratively removes prefixes like 'model.network.' to find the raw weight keys.
+    Extracts the state dictionary from various checkpoint formats.
+    Handles both raw dictionaries and Lightning-style {state_dict: {...}} structures.
     """
-    if "state_dict" in state and isinstance(state["state_dict"], dict):
-        state = state["state_dict"]
+    if "state_dict" in raw and isinstance(raw["state_dict"], dict):
+        return raw["state_dict"]
+    return raw
 
-    if not isinstance(state, dict):
-        raise ValueError("Checkpoint format not recognized (expected dict or state_dict).")
 
-    clean: Dict[str, torch.Tensor] = {}
+def _strip_prefixes(k: str, prefixes: Tuple[str, ...]) -> str:
+    """Recursively removes specific prefixes from state_dict keys."""
+    changed = True
+    k2 = k
+    while changed:
+        changed = False
+        for p in prefixes:
+            if k2.startswith(p):
+                k2 = k2[len(p):]
+                changed = True
+    return k2
+
+
+def _clean_state_dict_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Normalizes common state_dict key prefixes resulting from 
+    Lightning, DataParallel, or custom wrappers.
+    """
+    prefixes = ("network.", "model.", "module.")
+    clean = {}
     for k, v in state.items():
-        if not torch.is_tensor(v):
-            continue
-        k2 = k
-        changed = True
-        while changed:
-            changed = False
-            for p in allowed_prefixes:
-                if k2.startswith(p):
-                    k2 = k2[len(p):]
-                    changed = True
+        k2 = _strip_prefixes(k, prefixes)
         clean[k2] = v
     return clean
 
 
-def _load_weights_fuzzy(
-    model: nn.Module,
-    ckpt_path: str,
-    device: torch.device,
-    strict_load: bool = False,
-    min_loaded_ratio: float = 0.70,
-) -> None:
+def _load_weights_robust(model: nn.Module, ckpt_path: str, device: torch.device) -> Tuple[int, int]:
     """
-    Loads weights from a checkpoint using shape-matching and key-normalization.
-    If strict_load is enabled, it raises an error if the percentage of loaded keys 
-    falls below min_loaded_ratio, preventing silent architecture mismatches.
+    Fuzzy weight loading:
+    - Accepts checkpoints with mismatched keys.
+    - Loads only parameters with compatible shapes.
+    - Does not fail on missing or unexpected keys.
+    Returns: (num_missing, num_unexpected)
     """
     raw = torch.load(ckpt_path, map_location="cpu")
-    state = _clean_state_dict_keys(raw)
+    state = _clean_state_dict_keys(_unwrap_state_dict(raw))
 
     own = model.state_dict()
-    loadable: Dict[str, torch.Tensor] = {}
+    loadable = {}
 
     for k, v in state.items():
         if k in own and own[k].shape == v.shape:
             loadable[k] = v
 
-    # Fallback: attempt to strip optional leading "eomt." prefix
+    # Fallback: attempt to remove optional "eomt." prefix if no matches found
     if len(loadable) == 0:
         for k, v in state.items():
             k2 = re.sub(r"^eomt\.", "", k)
@@ -119,65 +99,45 @@ def _load_weights_fuzzy(
                 loadable[k2] = v
 
     missing, unexpected = model.load_state_dict(loadable, strict=False)
-
     model.to(device)
     model.eval()
 
-    loaded_ratio = len(loadable) / max(1, len(own))
+    return len(missing), len(unexpected)
 
-    print(f"[EoMT] Loaded weights from: {ckpt_path}")
-    print(f"[EoMT] Match ratio: {len(loadable)} / {len(own)} ({loaded_ratio*100:.1f}%)")
-    
-    if len(missing) > 0:
-        print(f"[EoMT] Missing keys (first 20): {missing[:20]}")
 
-    if strict_load and loaded_ratio < min_loaded_ratio:
-        raise RuntimeError(
-            f"[EoMT] Critical weight mismatch! Only {loaded_ratio*100:.1f}% weights loaded. "
-            "Verify your YAML config and checkpoint compatibility."
-        )
+def _load_weights_prof_exact(model: nn.Module, ckpt_path: str, device: torch.device) -> None:
+    """
+    Strict weight loading:
+    - Attempts to load all keys after prefix cleaning.
+    - Raises clear errors on architecture mismatches (strict=True).
+    """
+    raw = torch.load(ckpt_path, map_location="cpu")
+    state = _clean_state_dict_keys(_unwrap_state_dict(raw))
+
+    model.load_state_dict(state, strict=True)
+    model.to(device)
+    model.eval()
 
 
 class EoMTWrapper(nn.Module):
     """
-    Robust wrapper for the EoMT (Everything on Mask Transformer) model.
-    Automatically parses architecture parameters from the professor's YAML config
-    to ensure the model structure perfectly matches the checkpoint.
+    A robust wrapper for the Everything on Mask Transformer (EoMT) model.
+    Handles dynamic aliasing of subpackages and offers flexible weight loading modes.
     """
     def __init__(
         self,
-        config_path: str,
         img_size: Tuple[int, int],
         num_classes: int = 19,
+        num_q: int = 100,
+        num_blocks: int = 3,
+        backbone_name: str = "vit_base_patch14_reg4_dinov2",
         masked_attn_enabled: bool = True,
     ):
         super().__init__()
 
-        # Fix internal EoMT absolute imports
+        # Fix internal EoMT absolute imports before model instantiation
         _alias_eomt_subpackages()
-        
-        # Load configuration to extract architectural hyperparameters
-        cfg = _safe_read_yaml(config_path)
 
-        num_q = _yaml_get(cfg, ("model", "init_args", "network", "init_args", "num_q"), default=100)
-        num_blocks = _yaml_get(cfg, ("model", "init_args", "network", "init_args", "num_blocks"), default=3)
-        backbone_name = _yaml_get(
-            cfg,
-            ("model", "init_args", "network", "init_args", "encoder", "init_args", "backbone_name"),
-            default="vit_base_patch14_reg4_dinov2",
-        )
-
-        self.meta = {
-            "config_path": str(config_path),
-            "img_size": tuple(img_size),
-            "num_classes": int(num_classes),
-            "num_q": int(num_q),
-            "num_blocks": int(num_blocks),
-            "backbone_name": str(backbone_name),
-            "masked_attn_enabled": bool(masked_attn_enabled),
-        }
-
-        # Imports must occur after aliasing
         from eomt.models.vit import ViT
         from eomt.models.eomt import EoMT
 
@@ -190,15 +150,34 @@ class EoMTWrapper(nn.Module):
             masked_attn_enabled=masked_attn_enabled,
         )
 
-    def load(self, ckpt_path: str, device: torch.device, strict_load: bool = False) -> None:
-        """Loads weights into the wrapped EoMT model."""
-        _load_weights_fuzzy(self.net, ckpt_path, device, strict_load=strict_load)
+        self.img_size = img_size
+        self.num_classes = num_classes
+        self.num_q = num_q
+        self.num_blocks = num_blocks
+        self.backbone_name = backbone_name
+        self.masked_attn_enabled = masked_attn_enabled
+
+    def load(self, ckpt_path: str, device: torch.device, mode: str = "robust") -> None:
+        """
+        Loads model weights. 
+        'mode' can be 'prof-exact' for strict loading or 'robust' for fuzzy matching.
+        """
+        mode = mode.lower()
+        if mode == "prof-exact":
+            _load_weights_prof_exact(self.net, ckpt_path, device)
+            print(f"[EoMT][prof-exact] Loaded STRICT weights from: {ckpt_path}")
+        else:
+            miss, unexp = _load_weights_robust(self.net, ckpt_path, device)
+            print(f"[EoMT][robust] Loaded fuzzy weights from: {ckpt_path} | missing={miss} unexpected={unexp}")
 
     @torch.no_grad()
     def forward_masks_and_classes(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Runs inference and returns masks and class logits from the final decoder layer.
-        Returns: (mask_logits [B, Q, H, W], class_logits [B, Q, C])
+        Inference hook that returns logits from the FINAL decoder layer:
+        - mask_logits: [B, Q, H, W]
+        - class_logits: [B, Q, C(+1)]
         """
         mask_list, class_list = self.net(x)
-        return mask_list[-1], class_list[-1]
+        mask_logits = mask_list[-1]
+        class_logits = class_list[-1]
+        return mask_logits, class_logits

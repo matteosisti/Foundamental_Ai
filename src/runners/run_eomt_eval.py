@@ -234,7 +234,8 @@ def main():
 		num_blocks = 3
 
 	model = EoMTWrapper(
-		num_classes=args.num_classes,
+		img_size=size_hw,
+        num_classes=args.num_classes,
 		num_q=num_q,
 		num_blocks=num_blocks,
 		backbone_name=backbone,

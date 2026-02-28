@@ -140,7 +140,41 @@ def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Te
 
 	raise ValueError(f"Unknown method: {method}")
 
+def rba_from_masks(
+	mask_logits: torch.Tensor,   # [B,Q,h,w]
+	class_logits: torch.Tensor,  # [B,Q,C(+1)]
+	num_classes: int,
+	temperature: float,
+	area_pow: float = 0.5,
+) -> torch.Tensor:
+	"""
+	Region-based anomaly (RBA) - practical MaskFormer-style variant.
+	Idea:
+	- Each query predicts a region (mask_prob) and a class distribution.
+	- Query confidence = max class prob (excluding no-object)
+	- Region size = mean(mask_prob)  (proxy for area)
+	- Query "reliability" = conf * (area^area_pow)
+	- Pixel normality = max over queries of (reliability * mask_prob)
+	- Anomaly = 1 - pixel_normality
 
+	Returns anomaly map [B,h,w] (higher => more anomalous)
+	"""
+	if class_logits.shape[-1] == num_classes + 1:
+		class_logits = class_logits[..., :num_classes]
+
+	class_prob = F.softmax(class_logits / temperature, dim=-1)   # [B,Q,C]
+	conf = class_prob.max(dim=-1).values                         # [B,Q]
+
+	mask_prob = torch.sigmoid(mask_logits)                       # [B,Q,h,w]
+	area = mask_prob.mean(dim=(-2, -1))                           # [B,Q]
+
+	reliability = conf * (area.clamp_min(1e-6) ** area_pow)       # [B,Q]
+	reliability = reliability.unsqueeze(-1).unsqueeze(-1)         # [B,Q,1,1]
+
+	# normality per pixel = best query that "covers" it with high reliability
+	normality = (reliability * mask_prob).amax(dim=1)             # [B,h,w]
+	anomaly = 1.0 - normality
+	return anomaly
 # ------------------------
 # Artifact saving
 # ------------------------
@@ -177,210 +211,228 @@ def append_metrics_csv(csv_path: str, row: dict) -> None:
 # ------------------------
 @torch.no_grad()
 def main():
-	ap = argparse.ArgumentParser()
-	ap.add_argument("--input", required=True, help="Glob images, e.g. .../images/*.*")
-	ap.add_argument("--ckpt", required=True, help="EoMT checkpoint (.bin)")
-	ap.add_argument("--config", default="eomt/configs/dinov2/cityscapes/semantic/eomt_base_640.yaml")
-	ap.add_argument("--dataset-name", required=True, help="Short name: RA21, RO21, FS_STATIC, LAF, RA")
-	ap.add_argument("--method", choices=["msp", "maxlogit", "maxentropy"], default="msp")
-	ap.add_argument("--temperature", type=float, default=1.0)
-	ap.add_argument("--num-classes", type=int, default=19)
-	ap.add_argument("--resize", default=None, help="HxW e.g. 640x640. If None inferred from config name.")
-	ap.add_argument("--artifacts-dir", default="artifacts")
-	ap.add_argument("--save-logits", action="store_true", help="Cache pixel_probs (float16) + gt + names")
-	ap.add_argument("--cpu", action="store_true")
-	args = ap.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True, help="Glob images, e.g. .../images/*.*")
+    ap.add_argument("--ckpt", required=True, help="EoMT checkpoint (.bin)")
+    ap.add_argument("--config", default="eomt/configs/dinov2/cityscapes/semantic/eomt_base_640.yaml")
+    ap.add_argument("--dataset-name", required=True, help="Short name: RA21, RO21, FS_STATIC, LAF, RA")
+    ap.add_argument("--method", choices=["msp", "maxlogit", "maxentropy", "rba"], default="msp")
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--num-classes", type=int, default=19)
+    ap.add_argument("--resize", default=None, help="HxW e.g. 640x640. If None inferred from config name.")
+    ap.add_argument("--artifacts-dir", default="artifacts")
+    ap.add_argument("--save-logits", action="store_true", help="Cache pixel_probs (float16) + gt + names")
+    ap.add_argument("--cpu", action="store_true")
+    args = ap.parse_args()
 
-	# device
-	device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
-	print("[device]", device)
+    # device
+    device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
+    print("[device]", device)
 
-	# infer resize from config if not provided
-	if args.resize is None:
-		cfg_lower = os.path.basename(args.config).lower()
-		if "1024" in cfg_lower:
-			H = W = 1024
-		elif "640" in cfg_lower:
-			H = W = 640
-		else:
-			H = W = 640
-	else:
-		# parse "HxW"
-		hw = args.resize.lower().replace(" ", "").split("x")
-		if len(hw) != 2:
-			raise ValueError("--resize must be like 640x640")
-		H, W = int(hw[0]), int(hw[1])
+    # infer resize from config if not provided
+    if args.resize is None:
+        cfg_lower = os.path.basename(args.config).lower()
+        if "1024" in cfg_lower:
+            H = W = 1024
+        elif "640" in cfg_lower:
+            H = W = 640
+        else:
+            H = W = 640
+    else:
+        # parse "HxW"
+        hw = args.resize.lower().replace(" ", "").split("x")
+        if len(hw) != 2:
+            raise ValueError("--resize must be like 640x640")
+        H, W = int(hw[0]), int(hw[1])
 
-	size_hw = (H, W)
+    size_hw = (H, W)
 
-	# transforms
-	input_transform = Compose([
-		Resize(size_hw, Image.BILINEAR),
-		ToTensor(),
-	])
+    # transforms
+    input_transform = Compose([
+        Resize(size_hw, Image.BILINEAR),
+        ToTensor(),
+    ])
 
-	# init model (we read minimal fields from YAML name)
-	# For now we assume base_640 => vit_base_patch14_reg4_dinov2, num_q=100, num_blocks=3
-	# You can extend later by parsing YAML if needed.
-	backbone = "vit_base_patch14_reg4_dinov2"
-	num_q = 100
-	num_blocks = 3
+    # init model (we read minimal fields from YAML name)
+    # For now we assume base_640 => vit_base_patch14_reg4_dinov2, num_q=100, num_blocks=3
+    # You can extend later by parsing YAML if needed.
+    backbone = "vit_base_patch14_reg4_dinov2"
+    num_q = 100
+    num_blocks = 3
 
-	if "large" in os.path.basename(args.config).lower():
-		# most likely large model
-		backbone = "vit_large_patch14_reg4_dinov2"
-		# still keep defaults unless you confirm config differs
-		num_q = 100
-		num_blocks = 3
+    if "large" in os.path.basename(args.config).lower():
+        # most likely large model
+        backbone = "vit_large_patch14_reg4_dinov2"
+        # still keep defaults unless you confirm config differs
+        num_q = 100
+        num_blocks = 3
 
-	model = EoMTWrapper(
-		img_size=size_hw,
+    model = EoMTWrapper(
+        img_size=size_hw,
         num_classes=args.num_classes,
-		num_q=num_q,
-		num_blocks=num_blocks,
-		backbone_name=backbone,
-		masked_attn_enabled=True,
-	)
-	model.load(args.ckpt, device)
+        num_q=num_q,
+        num_blocks=num_blocks,
+        backbone_name=backbone,
+        masked_attn_enabled=True,
+    )
+    model.load(args.ckpt, device)
 
-	# paths
-	paths = sorted(glob.glob(os.path.expanduser(args.input)))
-	if len(paths) == 0:
-		raise FileNotFoundError(f"No images found for: {args.input}")
+    # paths
+    paths = sorted(glob.glob(os.path.expanduser(args.input)))
+    if len(paths) == 0:
+        raise FileNotFoundError(f"No images found for: {args.input}")
 
-	# artifacts
-	res_dir, log_dir = ensure_dirs(args.artifacts_dir)
-	metrics_csv = os.path.join(res_dir, "metrics.csv")
+    # artifacts
+    res_dir, log_dir = ensure_dirs(args.artifacts_dir)
+    metrics_csv = os.path.join(res_dir, "metrics.csv")
 
-	# run
-	anomaly_list: List[np.ndarray] = []
-	ood_list: List[np.ndarray] = []
-	names: List[str] = []
-	pixel_cache: List[np.ndarray] = []
+    # run
+    anomaly_list: List[np.ndarray] = []
+    ood_list: List[np.ndarray] = []
+    names: List[str] = []
+    pixel_cache: List[np.ndarray] = []
 
-	for p in paths:
-		try:
-			ood = load_ood_mask(p, size_hw=size_hw)
-		except Exception as e:
-			print(f"[SKIP] GT error {p}: {e}")
-			continue
+    for p in paths:
+        try:
+            ood = load_ood_mask(p, size_hw=size_hw)
+        except Exception as e:
+            print(f"[SKIP] GT error {p}: {e}")
+            continue
 
-		# keep only images that contain OOD pixels
-		if 1 not in np.unique(ood):
-			continue
+        # keep only images that contain OOD pixels
+        if 1 not in np.unique(ood):
+            continue
 
-		img = Image.open(p).convert("RGB")
-		x = input_transform(img).unsqueeze(0).float().to(device)	# [1,3,H,W]
+        img = Image.open(p).convert("RGB")
+        x = input_transform(img).unsqueeze(0).float().to(device)    # [1,3,H,W]
 
-		mask_logits, class_logits = model.forward_masks_and_classes(x)
+        mask_logits, class_logits = model.forward_masks_and_classes(x)
 
-		pixel_probs = pixel_probs_from_masks(
-			mask_logits=mask_logits,
-			class_logits=class_logits,
-			num_classes=args.num_classes,
-			temperature=args.temperature,
-		)  # [1,C,H,W]
+        # Anomaly score calculation based on the selected method
+        if args.method == "rba":
+            anomaly = rba_from_masks(
+                mask_logits=mask_logits,
+                class_logits=class_logits,
+                num_classes=args.num_classes,
+                temperature=args.temperature,
+            )
+            # Even for RBA, compute pixel_probs if logit caching is required
+            if args.save_logits:
+                pixel_probs = pixel_probs_from_masks(
+                    mask_logits=mask_logits,
+                    class_logits=class_logits,
+                    num_classes=args.num_classes,
+                    temperature=args.temperature,
+                )
+        else:
+            pixel_probs = pixel_probs_from_masks(
+                mask_logits=mask_logits,
+                class_logits=class_logits,
+                num_classes=args.num_classes,
+                temperature=args.temperature,
+            )  # [1,C,H,W]
+            anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)  # [1,H,W]
 
-		anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)  # [1,H,W]
-		if anomaly.shape[-2:] != size_hw:
-			anomaly = F.interpolate(
-				anomaly.unsqueeze(1),  # [1,1,h,w]
+        # Upsample anomaly map if output resolution is lower than input (e.g., Transformer stride-4)
+        if anomaly.shape[-2:] != size_hw:
+            anomaly = F.interpolate(
+                anomaly.unsqueeze(1),  # [1,1,h,w]
                 size=size_hw,
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(1)  # [1,H,W]
-		anomaly_np = anomaly.squeeze(0).detach().cpu().float().numpy()
+        
+        anomaly_np = anomaly.squeeze(0).detach().cpu().float().numpy()
+        anomaly_list.append(anomaly_np)
+        ood_list.append(ood)
+        names.append(os.path.basename(p))
 
-		anomaly_list.append(anomaly_np)
-		ood_list.append(ood)
-		names.append(os.path.basename(p))
+        if args.save_logits:
+            # cache pixel probs, float16 to reduce size
+            pixel_cache.append(pixel_probs.squeeze(0).detach().cpu().to(torch.float16).numpy())
 
-		if args.save_logits:
-			# cache pixel probs, float16 to reduce size
-			pixel_cache.append(pixel_probs.squeeze(0).detach().cpu().to(torch.float16).numpy())
+    # metrics
+    ood_gts = np.array(ood_list)                # [N,H,W]
+    anomaly_scores = np.array(anomaly_list)     # [N,H,W]
+    n_used = len(anomaly_list)
 
-	# metrics
-	ood_gts = np.array(ood_list)				# [N,H,W]
-	anomaly_scores = np.array(anomaly_list)		# [N,H,W]
-	n_used = len(anomaly_list)
+    if n_used == 0:
+        raise RuntimeError("No valid images used (maybe GT mapping or empty OOD regions).")
 
-	if n_used == 0:
-		raise RuntimeError("No valid images used (maybe GT mapping or empty OOD regions).")
+    ood_mask = (ood_gts == 1)
+    in_mask = (ood_gts == 0)
 
-	ood_mask = (ood_gts == 1)
-	in_mask = (ood_gts == 0)
+    ood_out = anomaly_scores[ood_mask]
+    in_out = anomaly_scores[in_mask]
 
-	ood_out = anomaly_scores[ood_mask]
-	in_out = anomaly_scores[in_mask]
+    val_out = np.concatenate([in_out, ood_out])
+    val_label = np.concatenate([np.zeros(len(in_out)), np.ones(len(ood_out))])
 
-	val_out = np.concatenate([in_out, ood_out])
-	val_label = np.concatenate([np.zeros(len(in_out)), np.ones(len(ood_out))])
+    auprc = float(average_precision_score(val_label, val_out))
+    fpr95 = float(fpr_at_95_tpr(val_out, val_label))
 
-	auprc = float(average_precision_score(val_label, val_out))
-	fpr95 = float(fpr_at_95_tpr(val_out, val_label))
+    print("=====================================")
+    print(f"EoMT | dataset={args.dataset_name} | method={args.method} | T={args.temperature}")
+    print(f"AUPRC: {auprc*100.0:.4f}")
+    print(f"FPR@95TPR: {fpr95*100.0:.4f}")
+    print(f"Images used: {n_used}")
+    print(f"Resize: {H}x{W}")
+    print("=====================================")
 
-	print("=====================================")
-	print(f"EoMT | dataset={args.dataset_name} | method={args.method} | T={args.temperature}")
-	print(f"AUPRC: {auprc*100.0:.4f}")
-	print(f"FPR@95TPR: {fpr95*100.0:.4f}")
-	print(f"Images used: {n_used}")
-	print(f"Resize: {H}x{W}")
-	print("=====================================")
+    # save json result
+    stamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    out = {
+        "timestamp_utc": stamp,
+        "dataset": args.dataset_name,
+        "model": "EoMT",
+        "config": args.config,
+        "ckpt": args.ckpt,
+        "method": args.method,
+        "temperature": args.temperature,
+        "num_classes": args.num_classes,
+        "resize_h": H,
+        "resize_w": W,
+        "auprc": auprc,
+        "fpr95": fpr95,
+        "images_used": n_used,
+    }
 
-	# save json result
-	stamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-	out = {
-		"timestamp_utc": stamp,
-		"dataset": args.dataset_name,
-		"model": "EoMT",
-		"config": args.config,
-		"ckpt": args.ckpt,
-		"method": args.method,
-		"temperature": args.temperature,
-		"num_classes": args.num_classes,
-		"resize_h": H,
-		"resize_w": W,
-		"auprc": auprc,
-		"fpr95": fpr95,
-		"images_used": n_used,
-	}
+    json_name = f"{args.dataset_name}__EoMT__{args.method}__T{args.temperature}.json"
+    json_path = os.path.join(res_dir, json_name)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+    print(f"[SAVED] {json_path}")
 
-	json_name = f"{args.dataset_name}__EoMT__{args.method}__T{args.temperature}.json"
-	json_path = os.path.join(res_dir, json_name)
-	with open(json_path, "w", encoding="utf-8") as f:
-		json.dump(out, f, indent=2)
-	print(f"[SAVED] {json_path}")
+    # append metrics.csv
+    append_metrics_csv(metrics_csv, {
+        "timestamp": stamp,
+        "dataset": args.dataset_name,
+        "model": "EoMT",
+        "method": args.method,
+        "temperature": args.temperature,
+        "auprc": auprc,
+        "fpr95": fpr95,
+        "images_used": n_used,
+        "resize_h": H,
+        "resize_w": W,
+    })
+    print(f"[UPDATED] {metrics_csv}")
 
-	# append metrics.csv
-	append_metrics_csv(metrics_csv, {
-		"timestamp": stamp,
-		"dataset": args.dataset_name,
-		"model": "EoMT",
-		"method": args.method,
-		"temperature": args.temperature,
-		"auprc": auprc,
-		"fpr95": fpr95,
-		"images_used": n_used,
-		"resize_h": H,
-		"resize_w": W,
-	})
-	print(f"[UPDATED] {metrics_csv}")
+    # cache
+    if args.save_logits:
+        logits_path = os.path.join(log_dir, f"{args.dataset_name}__pixel_probs_f16.npy")
+        gt_path = os.path.join(log_dir, f"{args.dataset_name}__gt.npy")
+        names_path = os.path.join(log_dir, f"{args.dataset_name}__names.json")
 
-	# cache
-	if args.save_logits:
-		logits_path = os.path.join(log_dir, f"{args.dataset_name}__pixel_probs_f16.npy")
-		gt_path = os.path.join(log_dir, f"{args.dataset_name}__gt.npy")
-		names_path = os.path.join(log_dir, f"{args.dataset_name}__names.json")
+        np.save(logits_path, np.array(pixel_cache, dtype=np.float16))
+        np.save(gt_path, ood_gts.astype(np.uint8))
+        with open(names_path, "w", encoding="utf-8") as f:
+            json.dump(names, f, indent=2)
 
-		np.save(logits_path, np.array(pixel_cache, dtype=np.float16))
-		np.save(gt_path, ood_gts.astype(np.uint8))
-		with open(names_path, "w", encoding="utf-8") as f:
-			json.dump(names, f, indent=2)
-
-		print(f"[CACHED] {logits_path}")
-		print(f"[CACHED] {gt_path}")
-		print(f"[CACHED] {names_path}")
+        print(f"[CACHED] {logits_path}")
+        print(f"[CACHED] {gt_path}")
+        print(f"[CACHED] {names_path}")
 
 
 if __name__ == "__main__":
-	main()
+    main()

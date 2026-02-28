@@ -282,7 +282,13 @@ def main():
 		)  # [1,C,H,W]
 
 		anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)  # [1,H,W]
-
+		if anomaly.shape[-2:] != size_hw:
+			anomaly = F.interpolate(
+				anomaly.unsqueeze(1),  # [1,1,h,w]
+                size=size_hw,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)  # [1,H,W]
 		anomaly_np = anomaly.squeeze(0).detach().cpu().float().numpy()
 
 		anomaly_list.append(anomaly_np)

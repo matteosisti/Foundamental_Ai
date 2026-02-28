@@ -1,3 +1,7 @@
+# =========================
+# File: scripts/erfnet_temp_sweep_from_cache.py
+# (riscrittura completa del tuo secondo file)
+# =========================
 import json
 import csv
 import argparse
@@ -8,47 +12,11 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score
 
-
-def fpr_at_95_tpr(scores: np.ndarray, labels: np.ndarray) -> float:
-	"""
-	FPR when TPR is at least 95%.
-	scores: higher => more OOD
-	labels: 1=OOD, 0=InD
-	"""
-	scores = scores.astype(np.float64)
-	labels = labels.astype(np.int64)
-
-	# Sort by score desc
-	order = np.argsort(-scores)
-	scores = scores[order]
-	labels = labels[order]
-
-	P = (labels == 1).sum()
-	N = (labels == 0).sum()
-	if P == 0 or N == 0:
-		return float("nan")
-
-	tp = 0
-	fp = 0
-
-	# We sweep threshold from +inf to -inf by traversing sorted scores
-	tpr_target = 0.95
-	best_fpr = 1.0
-
-	for i in range(len(scores)):
-		if labels[i] == 1:
-			tp += 1
-		else:
-			fp += 1
-
-		tpr = tp / P
-		fpr = fp / N
-
-		if tpr >= tpr_target:
-			best_fpr = fpr
-			break
-
-	return float(best_fpr)
+# Robust import
+try:
+	from src.utils.ood_metrics import fpr_at_95_tpr
+except Exception:
+	from ood_metrics import fpr_at_95_tpr
 
 
 def append_metrics_csv(csv_path: Path, row: dict) -> None:
@@ -82,9 +50,8 @@ def main():
 		raise FileNotFoundError(f"Missing cache files: {logits_path} or {gt_path}")
 
 	logits = np.load(logits_path)  # [N,C,H,W]
-	gt = np.load(gt_path)          # [N,H,W]
+	gt = np.load(gt_path)		  # [N,H,W]
 
-	# Flatten pixel-wise labels once
 	ood_mask = (gt == 1)
 	ind_mask = (gt == 0)
 
@@ -95,9 +62,9 @@ def main():
 
 	for T in T_list:
 		# MSP(T): 1 - max softmax(logits/T)
-		p = F.softmax(logits_t / T, dim=1)                 # [N,C,H,W]
-		msp = torch.max(p, dim=1).values                   # [N,H,W]
-		anomaly = (1.0 - msp).numpy()                      # [N,H,W]
+		p = F.softmax(logits_t / T, dim=1)				 # [N,C,H,W]
+		msp = torch.max(p, dim=1).values				 # [N,H,W]
+		anomaly = (1.0 - msp).numpy()					 # [N,H,W]
 
 		ood_out = anomaly[ood_mask]
 		ind_out = anomaly[ind_mask]

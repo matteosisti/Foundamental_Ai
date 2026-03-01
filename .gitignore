@@ -19,3 +19,4 @@ Thumbs.db
 # Notebooks / colab junk
 .ipynb_checkpoints/
 *.ipynb
+*.npy

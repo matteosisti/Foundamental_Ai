@@ -1,12 +1,14 @@
 # src/runners/run_eomt_eval.py
+
 import os
 import glob
 import json
 import csv
 import argparse
-from datetime import datetime
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Any
 
 import numpy as np
 from PIL import Image
@@ -22,6 +24,14 @@ from src.utils.ood_metrics import fpr_at_95_tpr
 from src.utils.determinism import apply_determinism
 
 
+def _sha1_8_of_file(path: str) -> str:
+	h = hashlib.sha1()
+	with open(path, "rb") as f:
+		for chunk in iter(lambda: f.read(1024 * 1024), b""):
+			h.update(chunk)
+	return h.hexdigest()[:8]
+
+
 def gt_path_from_image(path_img: str) -> str:
 	path_gt = path_img.replace("images", "labels_masks")
 	root = path_gt
@@ -35,6 +45,7 @@ def gt_path_from_image(path_img: str) -> str:
 	if "LostAndFound" in root or "FS_LostFound_full" in root:
 		return os.path.splitext(root)[0] + ".png"
 
+	# fallback (assume already ends with ext)
 	return root
 
 
@@ -65,21 +76,20 @@ def load_ood_mask(path_img: str, size_hw: Tuple[int, int]) -> np.ndarray:
 
 
 def pixel_probs_from_masks(
-	mask_logits: torch.Tensor,	# [B,Q,h,w]
-	class_logits: torch.Tensor,	# [B,Q,C(+1)]
+	mask_logits: torch.Tensor,   # [B,Q,h,w]
+	class_logits: torch.Tensor,  # [B,Q,C(+1)]
 	num_classes: int,
 	temperature: float,
 ) -> torch.Tensor:
 	if class_logits.shape[-1] == num_classes + 1:
 		class_logits = class_logits[..., :num_classes]
 
-	class_prob = F.softmax(class_logits / temperature, dim=-1)	# [B,Q,C]
-	mask_prob = torch.sigmoid(mask_logits)						# [B,Q,h,w]
+	class_prob = F.softmax(class_logits / temperature, dim=-1)  # [B,Q,C]
+	mask_prob = torch.sigmoid(mask_logits)                      # [B,Q,h,w]
 
-	pixel = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)	# [B,C,h,w]
+	pixel = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)  # [B,C,h,w]
 	den = pixel.sum(dim=1, keepdim=True).clamp_min(1e-8)
-	pixel = pixel / den
-	return pixel
+	return pixel / den
 
 
 def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Tensor:
@@ -92,7 +102,6 @@ def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Te
 		return ent
 
 	if method == "maxlogit":
-		# proxy: log(prob)
 		logits_proxy = pixel_probs.clamp_min(1e-12).log()
 		m = logits_proxy.max(dim=1).values
 		return -m
@@ -101,8 +110,8 @@ def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Te
 
 
 def rba_from_masks(
-	mask_logits: torch.Tensor,	# [B,Q,h,w]
-	class_logits: torch.Tensor,	# [B,Q,C(+1)]
+	mask_logits: torch.Tensor,   # [B,Q,h,w]
+	class_logits: torch.Tensor,  # [B,Q,C(+1)]
 	num_classes: int,
 	temperature: float,
 	area_pow: float = 0.5,
@@ -110,18 +119,17 @@ def rba_from_masks(
 	if class_logits.shape[-1] == num_classes + 1:
 		class_logits = class_logits[..., :num_classes]
 
-	class_prob = F.softmax(class_logits / temperature, dim=-1)	# [B,Q,C]
-	conf = class_prob.max(dim=-1).values						# [B,Q]
+	class_prob = F.softmax(class_logits / temperature, dim=-1)  # [B,Q,C]
+	conf = class_prob.max(dim=-1).values                        # [B,Q]
 
-	mask_prob = torch.sigmoid(mask_logits)						# [B,Q,h,w]
-	area = mask_prob.mean(dim=(-2, -1))						# [B,Q]
+	mask_prob = torch.sigmoid(mask_logits)                      # [B,Q,h,w]
+	area = mask_prob.mean(dim=(-2, -1))                         # [B,Q]
 
-	reliability = conf * (area.clamp_min(1e-6) ** area_pow)		# [B,Q]
-	reliability = reliability.unsqueeze(-1).unsqueeze(-1)		# [B,Q,1,1]
+	reliability = conf * (area.clamp_min(1e-6) ** area_pow)     # [B,Q]
+	reliability = reliability.unsqueeze(-1).unsqueeze(-1)       # [B,Q,1,1]
 
-	normality = (reliability * mask_prob).amax(dim=1)			# [B,h,w]
-	anomaly = 1.0 - normality
-	return anomaly
+	normality = (reliability * mask_prob).amax(dim=1)           # [B,h,w]
+	return 1.0 - normality                                      # [B,h,w]
 
 
 def append_metrics_csv(csv_path: Path, row: dict) -> None:
@@ -151,7 +159,11 @@ def main():
 	ap.add_argument("--mode", choices=["robust", "prof-exact"], default="robust")
 
 	ap.add_argument("--seed", type=int, default=0)
-	ap.add_argument("--deterministic", action="store_true", help="Force determinism even in prof-exact")
+	ap.add_argument(
+		"--deterministic",
+		action="store_true",
+		help="Force determinism even in prof-exact (overrides default policy).",
+	)
 
 	ap.add_argument("--artifacts-dir", default="artifacts")
 	ap.add_argument("--save-logits", action="store_true", help="Cache raw mask/class logits + gt + names for sweep")
@@ -159,7 +171,19 @@ def main():
 
 	args = ap.parse_args()
 
-	apply_determinism(mode=args.mode, seed=args.seed, deterministic=args.deterministic)
+	# Determinism policy identical to ERFNet-style:
+	# - robust => deterministic by default
+	# - prof-exact => non-deterministic by default unless user forces --deterministic
+	if args.mode == "robust":
+		want_determinism = True
+	else:
+		want_determinism = bool(args.deterministic)
+
+	# If user explicitly asked --deterministic, override
+	if args.deterministic:
+		want_determinism = True
+
+	apply_determinism(mode=args.mode, seed=int(args.seed), deterministic=bool(want_determinism))
 
 	device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 	print("[device]", device)
@@ -186,7 +210,11 @@ def main():
 		ToTensor(),
 	])
 
-	# create run dir automatically
+	# checkpoint metadata
+	ckpt_basename = os.path.basename(args.ckpt)
+	ckpt_sha1_8 = _sha1_8_of_file(args.ckpt)
+
+	# create run dir (+ config dump)
 	art = create_run_dir(
 		artifacts_root=args.artifacts_dir,
 		dataset=args.dataset_name,
@@ -196,13 +224,18 @@ def main():
 		mode=args.mode,
 		extra={
 			"ckpt": args.ckpt,
+			"ckpt_basename": ckpt_basename,
+			"ckpt_sha1_8": ckpt_sha1_8,
 			"config": args.config,
 			"input_glob": args.input,
-			"resize_h": H,
-			"resize_w": W,
-			"num_classes": args.num_classes,
-			"seed": args.seed,
-			"deterministic": bool(args.deterministic),
+			"resize_h": int(H),
+			"resize_w": int(W),
+			"num_classes": int(args.num_classes),
+			"seed": int(args.seed),
+			"deterministic": bool(want_determinism),
+			"device": str(device),
+			"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+			"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
 		},
 	)
 	print("[ARTIFACTS]", art.root)
@@ -235,6 +268,9 @@ def main():
 	mask_logits_cache: List[np.ndarray] = []
 	class_logits_cache: List[np.ndarray] = []
 
+	logits_h = None
+	logits_w = None
+
 	for p in paths:
 		try:
 			ood = load_ood_mask(p, size_hw=size_hw)
@@ -242,6 +278,7 @@ def main():
 			print(f"[SKIP] GT error {p}: {e}")
 			continue
 
+		# skip if no OOD pixel
 		if 1 not in np.unique(ood):
 			continue
 
@@ -250,6 +287,11 @@ def main():
 
 		mask_logits, class_logits = model.forward_masks_and_classes(x)  # [1,Q,h,w], [1,Q,C(+1)]
 
+		# store native logits resolution once
+		if logits_h is None or logits_w is None:
+			logits_h, logits_w = int(mask_logits.shape[-2]), int(mask_logits.shape[-1])
+
+		# anomaly calc
 		if args.method == "rba":
 			anomaly = rba_from_masks(
 				mask_logits=mask_logits,
@@ -266,7 +308,7 @@ def main():
 			)  # [1,C,h,w]
 			anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)  # [1,h,w]
 
-		# upsample anomaly to input size if needed
+		# upsample anomaly to GT size if needed
 		if anomaly.shape[-2:] != size_hw:
 			anomaly = F.interpolate(
 				anomaly.unsqueeze(1),
@@ -289,8 +331,8 @@ def main():
 	if n_used == 0:
 		raise RuntimeError("No valid images used (maybe mapping or empty OOD regions).")
 
-	ood_gts = np.array(ood_list)
-	anomaly_scores = np.array(anomaly_list)
+	ood_gts = np.array(ood_list)          # [N,H,W]
+	anomaly_scores = np.array(anomaly_list)  # [N,H,W]
 
 	ood_mask = (ood_gts == 1)
 	in_mask = (ood_gts == 0)
@@ -304,25 +346,40 @@ def main():
 	auprc = float(average_precision_score(val_label, val_out))
 	fpr95 = float(fpr_at_95_tpr(val_out, val_label, mode=args.mode))
 
-	metrics = {
-		"timestamp_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+	metrics: Dict[str, Any] = {
+		"timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
 		"model": "EoMT",
 		"dataset": args.dataset_name,
 		"method": args.method,
 		"temperature": float(args.temperature),
 		"mode": args.mode,
+		"seed": int(args.seed),
+		"deterministic": bool(want_determinism),
+
 		"num_classes": int(args.num_classes),
 		"resize_h": int(H),
 		"resize_w": int(W),
+
+		"gt_h": int(ood_gts.shape[-2]),
+		"gt_w": int(ood_gts.shape[-1]),
+
+		"logits_h": int(logits_h) if logits_h is not None else None,
+		"logits_w": int(logits_w) if logits_w is not None else None,
+
 		"ckpt": args.ckpt,
+		"ckpt_basename": ckpt_basename,
+		"ckpt_sha1_8": ckpt_sha1_8,
 		"config": args.config,
-		"seed": int(args.seed),
-		"deterministic": bool(args.deterministic),
+
 		"auprc": auprc,
 		"fpr95": fpr95,
 		"auprc_pct": auprc * 100.0,
 		"fpr95_pct": fpr95 * 100.0,
 		"images_used": int(n_used),
+
+		"device": str(device),
+		"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+		"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
 	}
 
 	print("=====================================")
@@ -330,7 +387,7 @@ def main():
 	print(f"AUPRC: {metrics['auprc_pct']:.4f}")
 	print(f"FPR@95TPR: {metrics['fpr95_pct']:.4f}")
 	print(f"Images used: {metrics['images_used']}")
-	print(f"Resize: {H}x{W}")
+	print(f"Resize: {H}x{W} | logits: {metrics['logits_h']}x{metrics['logits_w']}")
 	print("=====================================")
 
 	json_path = art.results / "metrics.json"
@@ -344,9 +401,18 @@ def main():
 
 	# cache for sweep
 	if args.save_logits:
-		np.save(art.logits / f"{args.dataset_name}__mask_logits_f16.npy", np.array(mask_logits_cache, dtype=np.float16))
-		np.save(art.logits / f"{args.dataset_name}__class_logits_f16.npy", np.array(class_logits_cache, dtype=np.float16))
-		np.save(art.logits / f"{args.dataset_name}__gt.npy", ood_gts.astype(np.uint8))
+		np.save(
+			art.logits / f"{args.dataset_name}__mask_logits_f16.npy",
+			np.array(mask_logits_cache, dtype=np.float16),
+		)
+		np.save(
+			art.logits / f"{args.dataset_name}__class_logits_f16.npy",
+			np.array(class_logits_cache, dtype=np.float16),
+		)
+		np.save(
+			art.logits / f"{args.dataset_name}__gt.npy",
+			ood_gts.astype(np.uint8),
+		)
 		with open(art.logits / f"{args.dataset_name}__names.json", "w", encoding="utf-8") as f:
 			json.dump(names, f, indent=2)
 

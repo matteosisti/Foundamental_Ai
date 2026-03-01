@@ -1,4 +1,11 @@
 # src/runners/sweep_temp_from_cache_eomt.py
+#
+# Temperature sweep for EoMT using cached mask/class logits.
+# Expects cache files (from run_eomt_eval.py):
+#   logits/<DATASET>__mask_logits_f16.npy   [N,Q,h,w] float16
+#   logits/<DATASET>__class_logits_f16.npy  [N,Q,C(+1)] float16
+#   logits/<DATASET>__gt.npy                [N,H,W] uint8
+
 import os
 import re
 import json
@@ -13,10 +20,10 @@ import torch.nn.functional as F
 from sklearn.metrics import average_precision_score
 
 from src.utils.ood_metrics import fpr_at_95_tpr
+from src.utils.determinism import apply_determinism
 
 
 RUN_RE = re.compile(
-	# 2026-03-01_13-22-52__msp__T1.0__prof-exact__5e899996
 	r"^(?P<ts>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})__"
 	r"(?P<method>[^_]+)__"
 	r"T(?P<T>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)__"
@@ -117,16 +124,13 @@ def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Te
 	if method == "msp":
 		msp = pixel_probs.max(dim=1).values
 		return 1.0 - msp
-
 	if method == "maxentropy":
 		ent = -(pixel_probs * pixel_probs.clamp_min(1e-12).log()).sum(dim=1)
 		return ent
-
 	if method == "maxlogit":
 		logits_proxy = pixel_probs.clamp_min(1e-12).log()
 		m = logits_proxy.max(dim=1).values
 		return -m
-
 	raise ValueError(f"Unknown method: {method}")
 
 
@@ -154,23 +158,19 @@ def rba_from_masks(
 
 
 def upsample_to_gt(anomaly: torch.Tensor, gt_hw: Tuple[int, int]) -> torch.Tensor:
-	# anomaly: [N,h,w] -> [N,H,W]
 	H, W = gt_hw
 	if anomaly.shape[-2:] == (H, W):
 		return anomaly
 	return F.interpolate(
-		anomaly.unsqueeze(1),  # [N,1,h,w]
+		anomaly.unsqueeze(1),
 		size=(H, W),
 		mode="bilinear",
 		align_corners=False,
 	).squeeze(1)
 
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
-	ap = argparse.ArgumentParser()
+	ap = argparse.ArgumentParser(description="Temperature sweep from cached EoMT logits (CPU/GPU).")
 
 	ap.add_argument("--dataset-name", required=True, help="e.g. RA21")
 	ap.add_argument("--artifacts-dir", default="artifacts")
@@ -181,12 +181,24 @@ def main():
 	ap.add_argument("--num-classes", type=int, default=19)
 	ap.add_argument("--temperatures", default="0.5,0.75,1.0,1.1,1.25,1.5,2.0")
 
-	ap.add_argument("--use-latest", action="store_true", help="Use latest run matching method+mode")
-	ap.add_argument("--run-dir", default=None, help="Manual run dir override")
+	ap.add_argument("--use-latest", action="store_true")
+	ap.add_argument("--run-dir", default=None)
+
+	# NEW: device + determinism
+	ap.add_argument("--device", choices=["cpu", "cuda"], default=None, help="Default: cuda if available")
+	ap.add_argument("--seed", type=int, default=0)
+	ap.add_argument("--deterministic", action="store_true")
 
 	args = ap.parse_args()
 
+	apply_determinism(mode=args.mode, seed=int(args.seed), deterministic=bool(args.deterministic))
+
 	T_list = [float(x.strip()) for x in args.temperatures.split(",") if x.strip()]
+
+	if args.device is None:
+		device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	else:
+		device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
 
 	# Resolve run dir
 	if args.run_dir is not None:
@@ -206,12 +218,10 @@ def main():
 	if not logits_dir.exists():
 		raise FileNotFoundError(f"Missing logits dir: {logits_dir}")
 
-	# Sweep output folder avoids mixing
 	sweep_dir = run_root / "sweep" / f"{args.method}__{args.mode}"
 	sweep_dir.mkdir(parents=True, exist_ok=True)
 	csv_path = sweep_dir / "metrics_sweep.csv"
 
-	# Cache files (match run_eomt_eval.py)
 	mask_path = logits_dir / f"{args.dataset_name}__mask_logits_f16.npy"
 	class_path = logits_dir / f"{args.dataset_name}__class_logits_f16.npy"
 	gt_path = logits_dir / f"{args.dataset_name}__gt.npy"
@@ -223,9 +233,9 @@ def main():
 	if not gt_path.exists():
 		raise FileNotFoundError(f"Missing: {gt_path}")
 
-	mask_logits = np.load(mask_path)   # [N,Q,h,w] float16
-	class_logits = np.load(class_path) # [N,Q,C(+1)] float16
-	gt = np.load(gt_path)              # [N,H,W] uint8
+	mask_logits = np.load(mask_path)    # float16
+	class_logits = np.load(class_path)  # float16
+	gt = np.load(gt_path)               # uint8
 
 	N = int(gt.shape[0])
 	gt_H = int(gt.shape[1])
@@ -236,27 +246,29 @@ def main():
 	if ood_mask.sum() == 0 or ind_mask.sum() == 0:
 		raise RuntimeError("GT has no OOD or no InD pixels. Check remapping / dataset.")
 
-	# Torch once (CPU)
-	mask_t = torch.from_numpy(mask_logits.astype(np.float32))    # [N,Q,h,w]
-	class_t = torch.from_numpy(class_logits.astype(np.float32))  # [N,Q,C(+1)]
+	# Torch -> move ONCE to device (float32 math)
+	mask_t = torch.from_numpy(mask_logits.astype(np.float32)).to(device=device)
+	class_t = torch.from_numpy(class_logits.astype(np.float32)).to(device=device)
 
 	logits_h = int(mask_t.shape[-2])
 	logits_w = int(mask_t.shape[-1])
 
 	for T in T_list:
-		# Compute anomaly at logits resolution
+		Tv = float(T)
+
 		if args.method == "rba":
-			anomaly = rba_from_masks(mask_t, class_t, args.num_classes, T)  # [N,h,w]
+			anomaly_t = rba_from_masks(mask_t, class_t, args.num_classes, Tv)  # [N,h,w]
 		else:
-			pixel_probs = pixel_probs_from_masks(mask_t, class_t, args.num_classes, T)  # [N,C,h,w]
-			anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)                # [N,h,w]
+			pixel_probs = pixel_probs_from_masks(mask_t, class_t, args.num_classes, Tv)  # [N,C,h,w]
+			anomaly_t = anomaly_from_pixel_probs(pixel_probs, args.method)               # [N,h,w]
 
-		# Upsample to GT resolution (fix IndexError)
-		anomaly = upsample_to_gt(anomaly, (gt_H, gt_W))  # [N,H,W]
-		anomaly_np = anomaly.numpy()
+		anomaly_t = upsample_to_gt(anomaly_t, (gt_H, gt_W))  # [N,H,W]
 
-		ood_out = anomaly_np[ood_mask]
-		ind_out = anomaly_np[ind_mask]
+		# back to CPU numpy
+		anomaly = anomaly_t.detach().cpu().numpy()
+
+		ood_out = anomaly[ood_mask]
+		ind_out = anomaly[ind_mask]
 
 		val_out = np.concatenate([ind_out, ood_out])
 		val_label = np.concatenate([np.zeros(len(ind_out)), np.ones(len(ood_out))])
@@ -268,7 +280,7 @@ def main():
 			"model": "EoMT",
 			"dataset": args.dataset_name,
 			"method": args.method,
-			"temperature": float(T),
+			"temperature": Tv,
 			"mode": args.mode,
 			"num_classes": int(args.num_classes),
 			"auprc": auprc,
@@ -280,19 +292,21 @@ def main():
 			"gt_w": int(gt_W),
 			"logits_h": int(logits_h),
 			"logits_w": int(logits_w),
+			"device": str(device),
+			"seed": int(args.seed),
+			"deterministic": bool(args.deterministic),
 			"source": "raw_logits_cache",
 			"run_dir": str(run_root),
 		}
 
-		out_json = sweep_dir / f"T{T}__metrics.json"
+		out_json = sweep_dir / f"T{Tv}__metrics.json"
 		with open(out_json, "w", encoding="utf-8") as f:
 			json.dump(metrics, f, indent=2)
 
 		append_metrics_csv(csv_path, metrics)
+		print(f"[T={Tv}] AUPRC={metrics['auprc_pct']:.4f} | FPR95={metrics['fpr95_pct']:.4f} | saved {out_json}")
 
-		print(f"[T={T}] AUPRC={metrics['auprc_pct']:.4f} | FPR95={metrics['fpr95_pct']:.4f} | saved {out_json}")
-
-	print(f"[DONE] Run used: {run_root}")
+	print(f"[DONE] device={device} | Run used: {run_root}")
 	print(f"[DONE] Sweep results in: {sweep_dir}")
 
 

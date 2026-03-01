@@ -4,7 +4,7 @@ import json
 import csv
 import argparse
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -14,9 +14,6 @@ from sklearn.metrics import average_precision_score
 from src.utils.ood_metrics import fpr_at_95_tpr
 
 
-# -----------------------------
-# Small utils
-# -----------------------------
 def append_metrics_csv(csv_path: Path, row: dict) -> None:
 	write_header = not csv_path.exists()
 	fieldnames = list(row.keys())
@@ -35,13 +32,15 @@ def list_candidate_runs(model_root: Path) -> List[Path]:
 
 def parse_run_dir_name(name: str) -> Optional[dict]:
 	"""
-	Expected (from create_run_dir):
 	YYYY-MM-DD_HH-MM-SS__<method>__T<temp>__<mode>__<hash>
-
-	Example:
-	2026-03-01_13-22-30__msp__T1.0__robust__6e36b163
 	"""
-	pat = r"^(?P<ts>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})__(?P<method>[^_]+)__T(?P<T>[^_]+)__(?P<mode>robust|prof-exact)__(?P<hash>[0-9a-fA-F]+)$"
+	pat = (
+		r"^(?P<ts>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})__"
+		r"(?P<method>[^_]+)__"
+		r"T(?P<T>[^_]+)__"
+		r"(?P<mode>robust|prof-exact)__"
+		r"(?P<hash>[0-9a-fA-F]+)$"
+	)
 	m = re.match(pat, name)
 	if not m:
 		return None
@@ -71,7 +70,6 @@ def resolve_latest_run_dir_filtered(
 		if info["mode"] != mode:
 			continue
 
-		# lexical timestamp sorting works because format is YYYY-MM-DD_HH-MM-SS
 		ts = info["ts"]
 		if best is None or ts > best_ts:
 			best = p
@@ -85,7 +83,7 @@ def resolve_latest_run_dir_filtered(
 
 
 # -----------------------------
-# EoMT math
+# EoMT math (same as runner)
 # -----------------------------
 def pixel_probs_from_masks(
 	mask_logits: torch.Tensor,	# [N,Q,h,w]
@@ -93,7 +91,6 @@ def pixel_probs_from_masks(
 	num_classes: int,
 	temperature: float,
 ) -> torch.Tensor:
-	# discard void class if present
 	if class_logits.shape[-1] == num_classes + 1:
 		class_logits = class_logits[..., :num_classes]
 
@@ -115,7 +112,6 @@ def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Te
 		return ent
 
 	if method == "maxlogit":
-		# proxy logits from probs
 		logits_proxy = pixel_probs.clamp_min(1e-12).log()
 		m = logits_proxy.max(dim=1).values
 		return -m
@@ -146,6 +142,23 @@ def rba_from_masks(
 	return 1.0 - normality
 
 
+def upsample_to_gt(anomaly: torch.Tensor, gt_hw: Tuple[int, int]) -> torch.Tensor:
+	"""
+	anomaly: [N,h,w] tensor
+	return: [N,H,W] tensor
+	"""
+	H, W = gt_hw
+	if anomaly.shape[-2:] == (H, W):
+		return anomaly
+	# interpolate expects N,C,h,w
+	return F.interpolate(
+		anomaly.unsqueeze(1),
+		size=(H, W),
+		mode="bilinear",
+		align_corners=False,
+	).squeeze(1)
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -161,7 +174,6 @@ def main():
 	ap.add_argument("--num-classes", type=int, default=19)
 	ap.add_argument("--temperatures", default="0.5,0.75,1.0,1.1,1.25,1.5,2.0")
 
-	# selection
 	ap.add_argument("--use-latest", action="store_true", help="Use latest run matching method+mode")
 	ap.add_argument("--run-dir", default=None, help="Manual run dir override")
 
@@ -169,7 +181,7 @@ def main():
 
 	T_list = [float(x.strip()) for x in args.temperatures.split(",") if x.strip()]
 
-	# resolve run directory
+	# Resolve run dir
 	if args.run_dir is not None:
 		run_root = Path(os.path.expanduser(args.run_dir))
 	else:
@@ -187,11 +199,12 @@ def main():
 	if not logits_dir.exists():
 		raise FileNotFoundError(f"Missing logits dir: {logits_dir}")
 
-	# sweep subdir to avoid mixing
+	# Sweep output folder avoids mixing
 	sweep_dir = run_root / "sweep" / f"{args.method}__{args.mode}"
 	sweep_dir.mkdir(parents=True, exist_ok=True)
+	csv_path = sweep_dir / "metrics_sweep.csv"
 
-	# expected cache files
+	# Cache files
 	mask_path = logits_dir / f"{args.dataset_name}__mask_logits_f16.npy"
 	class_path = logits_dir / f"{args.dataset_name}__class_logits_f16.npy"
 	gt_path = logits_dir / f"{args.dataset_name}__gt.npy"
@@ -207,25 +220,29 @@ def main():
 	class_logits = np.load(class_path)	# [N,Q,C(+1)] float16
 	gt = np.load(gt_path)				# [N,H,W] uint8
 
+	N = int(gt.shape[0])
+	gt_H = int(gt.shape[1])
+	gt_W = int(gt.shape[2])
+
 	ood_mask = (gt == 1)
 	ind_mask = (gt == 0)
-
 	if ood_mask.sum() == 0 or ind_mask.sum() == 0:
 		raise RuntimeError("GT has no OOD or no InD pixels. Check remapping / dataset.")
 
-	# move to torch once
-	mask_t = torch.from_numpy(mask_logits.astype(np.float32))   # keep on CPU; small N anyway
-	class_t = torch.from_numpy(class_logits.astype(np.float32))
-
-	csv_path = sweep_dir / "metrics_sweep.csv"
+	# Torch once
+	mask_t = torch.from_numpy(mask_logits.astype(np.float32))   # [N,Q,h,w]
+	class_t = torch.from_numpy(class_logits.astype(np.float32)) # [N,Q,C(+1)]
 
 	for T in T_list:
+		# Compute anomaly at logits resolution
 		if args.method == "rba":
-			anomaly = rba_from_masks(mask_t, class_t, args.num_classes, T)	# [N,h,w]
+			anomaly = rba_from_masks(mask_t, class_t, args.num_classes, T)		# [N,h,w]
 		else:
-			pixel_probs = pixel_probs_from_masks(mask_t, class_t, args.num_classes, T)	# [N,C,h,w]
+			pixel_probs = pixel_probs_from_masks(mask_t, class_t, args.num_classes, T)  # [N,C,h,w]
 			anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)				# [N,h,w]
 
+		# IMPORTANT: upsample to GT resolution (fix IndexError)
+		anomaly = upsample_to_gt(anomaly, (gt_H, gt_W))  # [N,H,W]
 		anomaly_np = anomaly.numpy()
 
 		ood_out = anomaly_np[ood_mask]
@@ -248,7 +265,9 @@ def main():
 			"fpr95": fpr95,
 			"auprc_pct": auprc * 100.0,
 			"fpr95_pct": fpr95 * 100.0,
-			"images_used": int(gt.shape[0]),
+			"images_used": int(N),
+			"gt_h": int(gt_H),
+			"gt_w": int(gt_W),
 			"source": "raw_logits_cache",
 			"run_dir": str(run_root),
 		}

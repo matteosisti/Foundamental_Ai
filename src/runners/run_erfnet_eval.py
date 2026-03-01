@@ -1,3 +1,23 @@
+# src/runners/run_erfnet_eval.py
+#
+# Unified ERFNet OOD evaluation runner (robust + prof-exact) with:
+# - deterministic control via src.utils.determinism.apply_determinism(mode, seed, deterministic)
+# - artifacts folder auto-run dir + config.json via src.utils.artifacts.create_run_dir
+# - optional caching of RAW logits for temperature sweeps
+#
+# Example:
+#   python3 -m src.runners.run_erfnet_eval \
+#     --input "/content/drive/MyDrive/anom_project/Validation_Dataset/RoadAnomaly21/images/*.*" \
+#     --weights "/content/drive/MyDrive/anom_project/ckpts/erfnet/erfnet_pretrained.pth" \
+#     --dataset-name RA21 \
+#     --method msp \
+#     --temperature 1.0 \
+#     --mode robust \
+#     --seed 0 \
+#     --deterministic \
+#     --artifacts-dir "/content/drive/MyDrive/anom_project/artifacts" \
+#     --save-logits
+
 import os
 import glob
 import json
@@ -23,24 +43,38 @@ from src.utils.determinism import apply_determinism
 NUM_CLASSES = 20
 
 
+def _weights_meta(weights_path: str) -> dict:
+	p = Path(os.path.expanduser(weights_path))
+	meta = {
+		"weights": str(p),
+		"weights_basename": p.name,
+	}
+	try:
+		st = p.stat()
+		meta["weights_size_bytes"] = int(st.st_size)
+		meta["weights_mtime"] = float(st.st_mtime)
+	except Exception:
+		pass
+	return meta
+
+
 def load_erfnet(weights_path: str, device: torch.device, mode: str) -> torch.nn.Module:
 	"""
 	Mode handling:
-	- robust: fuzzy load (handles module. prefixes etc)
-	- prof-exact: stricter-ish load (tries to be closer to professor behavior)
+	- robust: fuzzy load (copy matching keys, tolerant to mismatches)
+	- prof-exact: stricter (still strips "module." but prefers exact shapes; strict=False for safety)
 	"""
 	model = ERFNet(NUM_CLASSES).to(device)
 
-	state = torch.load(weights_path, map_location="cpu")
+	state = torch.load(os.path.expanduser(weights_path), map_location="cpu")
 
-	# Handle checkpoints that may wrap the state_dict
+	# Some checkpoints might wrap the state_dict
 	if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
 		state = state["state_dict"]
 
 	own = model.state_dict()
 
 	if mode == "prof-exact":
-		# Keep only matching keys (and shapes). Still tolerate module. prefix mismatch.
 		loadable = {}
 		for k, v in state.items():
 			k2 = k.replace("module.", "")
@@ -48,7 +82,6 @@ def load_erfnet(weights_path: str, device: torch.device, mode: str) -> torch.nn.
 				loadable[k2] = v
 		model.load_state_dict(loadable, strict=False)
 	else:
-		# robust: copy matching tensors into our state dict (most permissive)
 		for k, v in state.items():
 			k2 = k.replace("module.", "")
 			if k2 in own and own[k2].shape == v.shape:
@@ -72,23 +105,24 @@ def gt_path_from_image(path_img: str) -> str:
 	if "LostAndFound" in root or "FS_LostFound_full" in root:
 		return os.path.splitext(root)[0] + ".png"
 
+	# fallback: keep extension if present, else add .png
 	ext = os.path.splitext(root)[1].lower()
 	return root if ext else (root + ".png")
 
 
 def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
-	# RoadAnomaly21: 2 -> OOD
+	# RoadAnomaly: OOD encoded as 2 -> map to 1
 	if "RoadAnomaly" in path_gt:
 		ood = np.where((ood == 2), 1, ood)
 
-	# LostAndFound / Fishyscapes Lost&Found: remap per common scripts
+	# LostAndFound mapping (common convention in anomaly benchmarks)
 	if "LostAndFound" in path_gt or "FS_LostFound_full" in path_gt:
 		ood = np.where((ood == 0), 255, ood)
 		ood = np.where((ood == 1), 0, ood)
 		ood = np.where((ood > 1) & (ood < 201), 1, ood)
 
-	# StreetHazards
-	if "Streethazard" in path_gt or "StreetHazard" in path_gt:
+	# StreetHazards mapping (if present)
+	if "Streethazard" in path_gt:
 		ood = np.where((ood == 14), 255, ood)
 		ood = np.where((ood < 20), 0, ood)
 		ood = np.where((ood == 255), 1, ood)
@@ -139,9 +173,8 @@ def main():
 	ap = argparse.ArgumentParser()
 
 	ap.add_argument("--input", required=True, help="Glob images, e.g. /path/images/*.*")
-	ap.add_argument("--weights", required=True, help="Path .pth ERFNet weights")
-	ap.add_argument("--dataset-name", required=True, help="Short dataset name e.g. RA21")
-
+	ap.add_argument("--weights", required=True, help="Path .pth ERFNet")
+	ap.add_argument("--dataset-name", required=True, help="Short name e.g. RA21")
 	ap.add_argument("--method", choices=["msp", "maxlogit", "maxentropy"], default="msp")
 	ap.add_argument("--temperature", type=float, default=1.0)
 	ap.add_argument("--mode", choices=["robust", "prof-exact"], default="robust")
@@ -153,7 +186,7 @@ def main():
 	ap.add_argument(
 		"--deterministic",
 		action="store_true",
-		help="Force deterministic inference (recommended for comparing logits).",
+		help="Force deterministic inference (useful to compare logits across runs).",
 	)
 
 	# Artifacts
@@ -165,23 +198,22 @@ def main():
 
 	# Default policy:
 	# - robust => deterministic by default
-	# - prof-exact => non-deterministic by default (closer to typical 'benchmark' style),
-	#                unless user forces deterministic
+	# - prof-exact => non-deterministic by default, unless user forces --deterministic
 	if args.mode == "robust":
 		want_determinism = True
 	else:
 		want_determinism = bool(args.deterministic)
 
-	# If user explicitly passed --deterministic, override
+	# If user explicitly asked, override
 	if args.deterministic:
 		want_determinism = True
 
-	# Must be called before first CUDA ops (best effort).
-	apply_determinism(seed=int(args.seed), deterministic=bool(want_determinism))
+	# IMPORTANT: call before first CUDA ops
+	apply_determinism(mode=args.mode, seed=int(args.seed), deterministic=bool(want_determinism))
 
 	device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 
-	# Fixed ERFNet eval resolution (as used in your runs)
+	# fixed transforms
 	resize_h, resize_w = 512, 1024
 	input_transform = Compose([
 		Resize((resize_h, resize_w), Image.BILINEAR),
@@ -191,7 +223,20 @@ def main():
 		Resize((resize_h, resize_w), Image.NEAREST),
 	])
 
-	# Artifacts: create run dir + config dump
+	# Create run dir (+ config.json)
+	extra = {
+		"input_glob": args.input,
+		"resize_h": int(resize_h),
+		"resize_w": int(resize_w),
+		"num_classes": int(NUM_CLASSES),
+		"device": str(device),
+		"seed": int(args.seed),
+		"deterministic": bool(want_determinism),
+		"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+		"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+	}
+	extra.update(_weights_meta(args.weights))
+
 	art = create_run_dir(
 		artifacts_root=args.artifacts_dir,
 		dataset=args.dataset_name,
@@ -199,18 +244,7 @@ def main():
 		method=args.method,
 		temperature=args.temperature,
 		mode=args.mode,
-		extra={
-			"weights": args.weights,
-			"input_glob": args.input,
-			"resize_h": resize_h,
-			"resize_w": resize_w,
-			"num_classes": NUM_CLASSES,
-			"device": str(device),
-			"seed": int(args.seed),
-			"deterministic": bool(want_determinism),
-			"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-			"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-		},
+		extra=extra,
 	)
 
 	print("[ARTIFACTS]", art.root)
@@ -235,7 +269,7 @@ def main():
 			print(f"[SKIP] GT error {path}: {e}")
 			continue
 
-		# skip if no OOD pixel (common baseline behavior)
+		# Skip if no OOD pixels
 		if 1 not in np.unique(ood):
 			continue
 
@@ -265,13 +299,13 @@ def main():
 	anomaly_scores = np.array(anomaly_list)  # [N,H,W]
 
 	ood_mask = (ood_gts == 1)
-	in_mask = (ood_gts == 0)
+	ind_mask = (ood_gts == 0)
 
 	ood_out = anomaly_scores[ood_mask]
-	in_out = anomaly_scores[in_mask]
+	ind_out = anomaly_scores[ind_mask]
 
-	val_out = np.concatenate([in_out, ood_out])
-	val_label = np.concatenate([np.zeros(len(in_out)), np.ones(len(ood_out))])
+	val_out = np.concatenate([ind_out, ood_out])
+	val_label = np.concatenate([np.zeros(len(ind_out)), np.ones(len(ood_out))])
 
 	auprc = float(average_precision_score(val_label, val_out))
 	fpr95 = float(fpr_at_95_tpr(val_out, val_label, mode=args.mode))
@@ -290,11 +324,11 @@ def main():
 		"fpr95_pct": fpr95 * 100.0,
 		"images_used": int(len(ood_list)),
 		"input_glob": args.input,
-		"weights": args.weights,
+		"weights": os.path.expanduser(args.weights),
 		"device": str(device),
-		"resize_h": resize_h,
-		"resize_w": resize_w,
-		"num_classes": NUM_CLASSES,
+		"resize_h": int(resize_h),
+		"resize_w": int(resize_w),
+		"num_classes": int(NUM_CLASSES),
 		"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
 		"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
 	}
@@ -316,7 +350,7 @@ def main():
 	append_metrics_csv(csv_path, metrics)
 	print(f"[SAVED] {csv_path}")
 
-	# Save cache (for sweep)
+	# Cache (for sweep)
 	if args.save_logits and len(logits_cache) > 0:
 		np.save(art.logits / f"{args.dataset_name}__logits.npy", np.stack(logits_cache, axis=0))
 		np.save(art.logits / f"{args.dataset_name}__gt.npy", np.stack(gt_cache, axis=0))

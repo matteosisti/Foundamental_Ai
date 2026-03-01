@@ -45,8 +45,12 @@ def gt_path_from_image(path_img: str) -> str:
 	if "LostAndFound" in root or "FS_LostFound_full" in root:
 		return os.path.splitext(root)[0] + ".png"
 
-	# fallback (assume already ends with ext)
 	return root
+
+
+def _is_already_binary_ood_mask(uvals: np.ndarray) -> bool:
+	s = set([int(x) for x in uvals.tolist()])
+	return s.issubset({0, 1, 255}) and (1 in s or 0 in s)
 
 
 def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
@@ -54,9 +58,11 @@ def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
 		ood = np.where((ood == 2), 1, ood)
 
 	if "LostAndFound" in path_gt or "FS_LostFound_full" in path_gt:
-		ood = np.where((ood == 0), 255, ood)
-		ood = np.where((ood == 1), 0, ood)
-		ood = np.where((ood > 1) & (ood < 201), 1, ood)
+		u_before = np.unique(ood)
+		if not _is_already_binary_ood_mask(u_before):
+			ood = np.where((ood == 0), 255, ood)
+			ood = np.where((ood == 1), 0, ood)
+			ood = np.where((ood > 1) & (ood < 201), 1, ood)
 
 	if "Streethazard" in path_gt:
 		ood = np.where((ood == 14), 255, ood)
@@ -75,61 +81,38 @@ def load_ood_mask(path_img: str, size_hw: Tuple[int, int]) -> np.ndarray:
 	return ood
 
 
-def pixel_probs_from_masks(
-	mask_logits: torch.Tensor,   # [B,Q,h,w]
-	class_logits: torch.Tensor,  # [B,Q,C(+1)]
-	num_classes: int,
-	temperature: float,
-) -> torch.Tensor:
+def pixel_probs_from_masks(mask_logits: torch.Tensor, class_logits: torch.Tensor, num_classes: int, temperature: float) -> torch.Tensor:
 	if class_logits.shape[-1] == num_classes + 1:
 		class_logits = class_logits[..., :num_classes]
-
-	class_prob = F.softmax(class_logits / temperature, dim=-1)  # [B,Q,C]
-	mask_prob = torch.sigmoid(mask_logits)                      # [B,Q,h,w]
-
-	pixel = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)  # [B,C,h,w]
+	class_prob = F.softmax(class_logits / temperature, dim=-1)
+	mask_prob = torch.sigmoid(mask_logits)
+	pixel = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)
 	den = pixel.sum(dim=1, keepdim=True).clamp_min(1e-8)
 	return pixel / den
 
 
 def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Tensor:
 	if method == "msp":
-		msp = pixel_probs.max(dim=1).values
-		return 1.0 - msp
-
+		return 1.0 - pixel_probs.max(dim=1).values
 	if method == "maxentropy":
-		ent = -(pixel_probs * pixel_probs.clamp_min(1e-12).log()).sum(dim=1)
-		return ent
-
+		return -(pixel_probs * pixel_probs.clamp_min(1e-12).log()).sum(dim=1)
 	if method == "maxlogit":
 		logits_proxy = pixel_probs.clamp_min(1e-12).log()
-		m = logits_proxy.max(dim=1).values
-		return -m
-
+		return -logits_proxy.max(dim=1).values
 	raise ValueError(f"Unknown method: {method}")
 
 
-def rba_from_masks(
-	mask_logits: torch.Tensor,   # [B,Q,h,w]
-	class_logits: torch.Tensor,  # [B,Q,C(+1)]
-	num_classes: int,
-	temperature: float,
-	area_pow: float = 0.5,
-) -> torch.Tensor:
+def rba_from_masks(mask_logits: torch.Tensor, class_logits: torch.Tensor, num_classes: int, temperature: float, area_pow: float = 0.5) -> torch.Tensor:
 	if class_logits.shape[-1] == num_classes + 1:
 		class_logits = class_logits[..., :num_classes]
-
-	class_prob = F.softmax(class_logits / temperature, dim=-1)  # [B,Q,C]
-	conf = class_prob.max(dim=-1).values                        # [B,Q]
-
-	mask_prob = torch.sigmoid(mask_logits)                      # [B,Q,h,w]
-	area = mask_prob.mean(dim=(-2, -1))                         # [B,Q]
-
-	reliability = conf * (area.clamp_min(1e-6) ** area_pow)     # [B,Q]
-	reliability = reliability.unsqueeze(-1).unsqueeze(-1)       # [B,Q,1,1]
-
-	normality = (reliability * mask_prob).amax(dim=1)           # [B,h,w]
-	return 1.0 - normality                                      # [B,h,w]
+	class_prob = F.softmax(class_logits / temperature, dim=-1)
+	conf = class_prob.max(dim=-1).values
+	mask_prob = torch.sigmoid(mask_logits)
+	area = mask_prob.mean(dim=(-2, -1))
+	reliability = conf * (area.clamp_min(1e-6) ** area_pow)
+	reliability = reliability.unsqueeze(-1).unsqueeze(-1)
+	normality = (reliability * mask_prob).amax(dim=1)
+	return 1.0 - normality
 
 
 def append_metrics_csv(csv_path: Path, row: dict) -> None:
@@ -146,40 +129,30 @@ def append_metrics_csv(csv_path: Path, row: dict) -> None:
 def main():
 	ap = argparse.ArgumentParser()
 
-	ap.add_argument("--input", required=True, help="Glob images, e.g. .../images/*.*")
-	ap.add_argument("--ckpt", required=True, help="EoMT checkpoint (.bin)")
+	ap.add_argument("--input", required=True)
+	ap.add_argument("--ckpt", required=True)
 	ap.add_argument("--config", default="eomt/configs/dinov2/cityscapes/semantic/eomt_base_640.yaml")
-
-	ap.add_argument("--dataset-name", required=True, help="Short name: RA21, RO21, FS_STATIC, LAF, ...")
+	ap.add_argument("--dataset-name", required=True)
 
 	ap.add_argument("--method", choices=["msp", "maxlogit", "maxentropy", "rba"], default="msp")
 	ap.add_argument("--temperature", type=float, default=1.0)
 	ap.add_argument("--num-classes", type=int, default=19)
-	ap.add_argument("--resize", default=None, help="HxW e.g. 640x640. If None inferred from config filename.")
+	ap.add_argument("--resize", default=None)
 	ap.add_argument("--mode", choices=["robust", "prof-exact"], default="robust")
 
 	ap.add_argument("--seed", type=int, default=0)
-	ap.add_argument(
-		"--deterministic",
-		action="store_true",
-		help="Force determinism even in prof-exact (overrides default policy).",
-	)
+	ap.add_argument("--deterministic", action="store_true")
 
 	ap.add_argument("--artifacts-dir", default="artifacts")
-	ap.add_argument("--save-logits", action="store_true", help="Cache raw mask/class logits + gt + names for sweep")
+	ap.add_argument("--save-logits", action="store_true")
 	ap.add_argument("--cpu", action="store_true")
 
 	args = ap.parse_args()
 
-	# Determinism policy identical to ERFNet-style:
-	# - robust => deterministic by default
-	# - prof-exact => non-deterministic by default unless user forces --deterministic
 	if args.mode == "robust":
 		want_determinism = True
 	else:
 		want_determinism = bool(args.deterministic)
-
-	# If user explicitly asked --deterministic, override
 	if args.deterministic:
 		want_determinism = True
 
@@ -188,7 +161,6 @@ def main():
 	device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 	print("[device]", device)
 
-	# infer resize
 	if args.resize is None:
 		cfg_lower = os.path.basename(args.config).lower()
 		if "1024" in cfg_lower:
@@ -210,11 +182,9 @@ def main():
 		ToTensor(),
 	])
 
-	# checkpoint metadata
 	ckpt_basename = os.path.basename(args.ckpt)
 	ckpt_sha1_8 = _sha1_8_of_file(args.ckpt)
 
-	# create run dir (+ config dump)
 	art = create_run_dir(
 		artifacts_root=args.artifacts_dir,
 		dataset=args.dataset_name,
@@ -240,7 +210,6 @@ def main():
 	)
 	print("[ARTIFACTS]", art.root)
 
-	# init model (same assumptions)
 	backbone = "vit_base_patch14_reg4_dinov2"
 	num_q = 100
 	num_blocks = 3
@@ -271,44 +240,38 @@ def main():
 	logits_h = None
 	logits_w = None
 
+	unique_before_all = set()
+	unique_after_all = set()
+
 	for p in paths:
 		try:
+			path_gt = gt_path_from_image(p)
+			raw = np.array(Resize(size_hw, Image.NEAREST)(Image.open(path_gt)))
+			unique_before_all.update([int(x) for x in np.unique(raw).tolist()])
+
 			ood = load_ood_mask(p, size_hw=size_hw)
+			unique_after_all.update([int(x) for x in np.unique(ood).tolist()])
 		except Exception as e:
 			print(f"[SKIP] GT error {p}: {e}")
 			continue
 
-		# skip if no OOD pixel
 		if 1 not in np.unique(ood):
 			continue
 
 		img = Image.open(p).convert("RGB")
 		x = input_transform(img).unsqueeze(0).float().to(device)
 
-		mask_logits, class_logits = model.forward_masks_and_classes(x)  # [1,Q,h,w], [1,Q,C(+1)]
+		mask_logits, class_logits = model.forward_masks_and_classes(x)
 
-		# store native logits resolution once
 		if logits_h is None or logits_w is None:
 			logits_h, logits_w = int(mask_logits.shape[-2]), int(mask_logits.shape[-1])
 
-		# anomaly calc
 		if args.method == "rba":
-			anomaly = rba_from_masks(
-				mask_logits=mask_logits,
-				class_logits=class_logits,
-				num_classes=args.num_classes,
-				temperature=args.temperature,
-			)  # [1,h,w]
+			anomaly = rba_from_masks(mask_logits, class_logits, args.num_classes, args.temperature)
 		else:
-			pixel_probs = pixel_probs_from_masks(
-				mask_logits=mask_logits,
-				class_logits=class_logits,
-				num_classes=args.num_classes,
-				temperature=args.temperature,
-			)  # [1,C,h,w]
-			anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)  # [1,h,w]
+			pixel_probs = pixel_probs_from_masks(mask_logits, class_logits, args.num_classes, args.temperature)
+			anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)
 
-		# upsample anomaly to GT size if needed
 		if anomaly.shape[-2:] != size_hw:
 			anomaly = F.interpolate(
 				anomaly.unsqueeze(1),
@@ -323,16 +286,19 @@ def main():
 		names.append(os.path.basename(p))
 
 		if args.save_logits:
-			# cache raw logits (temperature-agnostic)
 			mask_logits_cache.append(mask_logits.squeeze(0).detach().cpu().to(torch.float16).numpy())
 			class_logits_cache.append(class_logits.squeeze(0).detach().cpu().to(torch.float16).numpy())
 
 	n_used = len(anomaly_list)
 	if n_used == 0:
-		raise RuntimeError("No valid images used (maybe mapping or empty OOD regions).")
+		raise RuntimeError(
+			"No valid images used (maybe mapping or empty OOD regions). "
+			f"mask_unique_before={sorted(list(unique_before_all))} "
+			f"mask_unique_after={sorted(list(unique_after_all))}"
+		)
 
-	ood_gts = np.array(ood_list)          # [N,H,W]
-	anomaly_scores = np.array(anomaly_list)  # [N,H,W]
+	ood_gts = np.array(ood_list)
+	anomaly_scores = np.array(anomaly_list)
 
 	ood_mask = (ood_gts == 1)
 	in_mask = (ood_gts == 0)
@@ -359,10 +325,8 @@ def main():
 		"num_classes": int(args.num_classes),
 		"resize_h": int(H),
 		"resize_w": int(W),
-
 		"gt_h": int(ood_gts.shape[-2]),
 		"gt_w": int(ood_gts.shape[-1]),
-
 		"logits_h": int(logits_h) if logits_h is not None else None,
 		"logits_w": int(logits_w) if logits_w is not None else None,
 
@@ -380,6 +344,9 @@ def main():
 		"device": str(device),
 		"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
 		"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+
+		"mask_unique_before": sorted(list(unique_before_all)),
+		"mask_unique_after": sorted(list(unique_after_all)),
 	}
 
 	print("=====================================")
@@ -399,20 +366,10 @@ def main():
 	append_metrics_csv(csv_path, metrics)
 	print(f"[SAVED] {csv_path}")
 
-	# cache for sweep
 	if args.save_logits:
-		np.save(
-			art.logits / f"{args.dataset_name}__mask_logits_f16.npy",
-			np.array(mask_logits_cache, dtype=np.float16),
-		)
-		np.save(
-			art.logits / f"{args.dataset_name}__class_logits_f16.npy",
-			np.array(class_logits_cache, dtype=np.float16),
-		)
-		np.save(
-			art.logits / f"{args.dataset_name}__gt.npy",
-			ood_gts.astype(np.uint8),
-		)
+		np.save(art.logits / f"{args.dataset_name}__mask_logits_f16.npy", np.array(mask_logits_cache, dtype=np.float16))
+		np.save(art.logits / f"{args.dataset_name}__class_logits_f16.npy", np.array(class_logits_cache, dtype=np.float16))
+		np.save(art.logits / f"{args.dataset_name}__gt.npy", ood_gts.astype(np.uint8))
 		with open(art.logits / f"{args.dataset_name}__names.json", "w", encoding="utf-8") as f:
 			json.dump(names, f, indent=2)
 

@@ -68,7 +68,7 @@ def fpr_at_95_tpr_roc(scores: np.ndarray, labels: np.ndarray) -> float:
     match_indices = np.where(tpr >= 0.95)[0]
     if len(match_indices) == 0:
         return 1.0
-        
+	
     return float(fpr[match_indices[0]])
 
 

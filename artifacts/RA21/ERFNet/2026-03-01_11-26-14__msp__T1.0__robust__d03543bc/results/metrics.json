@@ -1,0 +1,15 @@
+{
+  "model": "ERFNet",
+  "dataset": "RA21",
+  "method": "msp",
+  "temperature": 1.0,
+  "mode": "robust",
+  "auprc": 0.14800932749512583,
+  "fpr95": 0.9498528597536691,
+  "auprc_pct": 14.800932749512583,
+  "fpr95_pct": 94.9852859753669,
+  "images_used": 10,
+  "input_glob": "/content/drive/MyDrive/anom_project/Validation_Dataset/RoadAnomaly21/images/*.*",
+  "weights": "trained_models/erfnet_pretrained.pth",
+  "device": "cuda"
+}

@@ -1,0 +1,12 @@
+{
+  "dataset": "RA21",
+  "model": "ERFNet",
+  "method": "msp",
+  "temperature": 1.0,
+  "mode": "robust",
+  "weights": "trained_models/erfnet_pretrained.pth",
+  "input_glob": "/content/drive/MyDrive/anom_project/Validation_Dataset/RoadAnomaly21/images/*.*",
+  "resize_h": 512,
+  "resize_w": 1024,
+  "num_classes": 20
+}

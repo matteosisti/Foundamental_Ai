@@ -1,9 +1,11 @@
+# src/runners/run_eomt_eval.py
 import os
 import glob
 import json
 import csv
 import argparse
 from datetime import datetime
+from pathlib import Path
 from typing import Tuple, List
 
 import numpy as np
@@ -17,15 +19,7 @@ from sklearn.metrics import average_precision_score
 from src.models.eomt_wrapper import EoMTWrapper
 from src.utils.artifacts import create_run_dir
 from src.utils.ood_metrics import fpr_at_95_tpr
-
-
-def set_determinism(mode: str) -> None:
-	if mode == "prof-exact":
-		torch.backends.cudnn.benchmark = True
-		torch.backends.cudnn.deterministic = False
-	else:
-		torch.backends.cudnn.benchmark = False
-		torch.backends.cudnn.deterministic = True
+from src.utils.determinism import apply_determinism
 
 
 def gt_path_from_image(path_img: str) -> str:
@@ -98,6 +92,7 @@ def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Te
 		return ent
 
 	if method == "maxlogit":
+		# proxy: log(prob)
 		logits_proxy = pixel_probs.clamp_min(1e-12).log()
 		m = logits_proxy.max(dim=1).values
 		return -m
@@ -155,13 +150,16 @@ def main():
 	ap.add_argument("--resize", default=None, help="HxW e.g. 640x640. If None inferred from config filename.")
 	ap.add_argument("--mode", choices=["robust", "prof-exact"], default="robust")
 
+	ap.add_argument("--seed", type=int, default=0)
+	ap.add_argument("--deterministic", action="store_true", help="Force determinism even in prof-exact")
+
 	ap.add_argument("--artifacts-dir", default="artifacts")
 	ap.add_argument("--save-logits", action="store_true", help="Cache raw mask/class logits + gt + names for sweep")
 	ap.add_argument("--cpu", action="store_true")
 
 	args = ap.parse_args()
 
-	set_determinism(args.mode)
+	apply_determinism(mode=args.mode, seed=args.seed, deterministic=args.deterministic)
 
 	device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 	print("[device]", device)
@@ -203,11 +201,13 @@ def main():
 			"resize_h": H,
 			"resize_w": W,
 			"num_classes": args.num_classes,
+			"seed": args.seed,
+			"deterministic": bool(args.deterministic),
 		},
 	)
 	print("[ARTIFACTS]", art.root)
 
-	# init model (same assumptions as you used)
+	# init model (same assumptions)
 	backbone = "vit_base_patch14_reg4_dinov2"
 	num_q = 100
 	num_blocks = 3
@@ -250,7 +250,6 @@ def main():
 
 		mask_logits, class_logits = model.forward_masks_and_classes(x)  # [1,Q,h,w], [1,Q,C(+1)]
 
-		# anomaly calc
 		if args.method == "rba":
 			anomaly = rba_from_masks(
 				mask_logits=mask_logits,
@@ -317,6 +316,8 @@ def main():
 		"resize_w": int(W),
 		"ckpt": args.ckpt,
 		"config": args.config,
+		"seed": int(args.seed),
+		"deterministic": bool(args.deterministic),
 		"auprc": auprc,
 		"fpr95": fpr95,
 		"auprc_pct": auprc * 100.0,

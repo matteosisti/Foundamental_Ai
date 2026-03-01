@@ -17,39 +17,44 @@ from eval.erfnet import ERFNet
 
 from src.utils.artifacts import create_run_dir
 from src.utils.ood_metrics import fpr_at_95_tpr
+from src.utils.determinism import set_determinism
 
 
 NUM_CLASSES = 20
 
 
-def set_determinism(mode: str) -> None:
-	# prof-exact: prof code often has active benchmark (not deterministic but more ‘similar’)
-	if mode == "prof-exact":
-		torch.backends.cudnn.benchmark = True
-		torch.backends.cudnn.deterministic = False
-	else:
-		torch.backends.cudnn.benchmark = False
-		torch.backends.cudnn.deterministic = True
-
-
-def load_erfnet(weights_path: str, device: torch.device) -> torch.nn.Module:
-	model = ERFNet(NUM_CLASSES)
-
-	if device.type == "cuda":
-		model = torch.nn.DataParallel(model).cuda()
-	else:
-		model = model.cpu()
+def load_erfnet(weights_path: str, device: torch.device, mode: str) -> torch.nn.Module:
+	"""
+	Mode handling:
+	- robust: fuzzy load (handles module. prefixes etc)
+	- prof-exact: stricter load (tries to mirror professor behavior)
+	"""
+	model = ERFNet(NUM_CLASSES).to(device)
 
 	state = torch.load(weights_path, map_location="cpu")
-	own = model.state_dict()
 
-	# robust load: handles keys with/without "module."
-	for k, v in state.items():
-		k2 = k.replace("module.", "")
-		if k2 in own and own[k2].shape == v.shape:
-			own[k2].copy_(v)
+	# Many checkpoints might be raw state_dict or nested
+	if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+		state = state["state_dict"]
 
-	model.load_state_dict(own, strict=False)
+	if mode == "prof-exact":
+		# try strict-ish: still allow "module." mismatch but prefer exact
+		own = model.state_dict()
+		loadable = {}
+		for k, v in state.items():
+			k2 = k.replace("module.", "")
+			if k2 in own and own[k2].shape == v.shape:
+				loadable[k2] = v
+		model.load_state_dict(loadable, strict=False)
+	else:
+		# robust: copy matching keys (handles more weird checkpoints)
+		own = model.state_dict()
+		for k, v in state.items():
+			k2 = k.replace("module.", "")
+			if k2 in own and own[k2].shape == v.shape:
+				own[k2].copy_(v)
+		model.load_state_dict(own, strict=False)
+
 	model.eval()
 	return model
 
@@ -67,7 +72,6 @@ def gt_path_from_image(path_img: str) -> str:
 	if "LostAndFound" in root or "FS_LostFound_full" in root:
 		return os.path.splitext(root)[0] + ".png"
 
-	# fallback
 	ext = os.path.splitext(root)[1].lower()
 	return root if ext else (root + ".png")
 
@@ -140,6 +144,14 @@ def main():
 
 	ap.add_argument("--cpu", action="store_true")
 
+	# Determinism controls
+	ap.add_argument("--seed", type=int, default=0)
+	ap.add_argument(
+		"--deterministic",
+		action="store_true",
+		help="Force deterministic inference (recommended for debugging / comparing logits).",
+	)
+
 	# Artifacts
 	ap.add_argument("--artifacts-dir", default="artifacts", help="Root artifacts folder (can be Drive)")
 	ap.add_argument("--save-logits", action="store_true", help="Cache logits+gt for temperature sweep")
@@ -147,20 +159,34 @@ def main():
 
 	args = ap.parse_args()
 
-	set_determinism(args.mode)
+	# Default policy:
+	# - robust => deterministic unless user explicitly wants non-deterministic
+	# - prof-exact => default non-deterministic (benchmark True), unless user forces deterministic
+	if args.mode == "robust":
+		want_determinism = True
+	else:
+		want_determinism = bool(args.deterministic)
+
+	# If user explicitly asked --deterministic, override
+	if args.deterministic:
+		want_determinism = True
+
+	# IMPORTANT: call before model init / first CUDA op
+	set_determinism(seed=args.seed, deterministic=want_determinism)
 
 	device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 
-	# fixed transforms (as you already used)
+	# fixed transforms
+	resize_h, resize_w = 512, 1024
 	input_transform = Compose([
-		Resize((512, 1024), Image.BILINEAR),
+		Resize((resize_h, resize_w), Image.BILINEAR),
 		ToTensor(),
 	])
 	target_transform = Compose([
-		Resize((512, 1024), Image.NEAREST),
+		Resize((resize_h, resize_w), Image.NEAREST),
 	])
 
-	# create run dir automatically
+	# create run dir automatically (+ config dump)
 	art = create_run_dir(
 		artifacts_root=args.artifacts_dir,
 		dataset=args.dataset_name,
@@ -171,15 +197,20 @@ def main():
 		extra={
 			"weights": args.weights,
 			"input_glob": args.input,
-			"resize_h": 512,
-			"resize_w": 1024,
+			"resize_h": resize_h,
+			"resize_w": resize_w,
 			"num_classes": NUM_CLASSES,
+			"device": str(device),
+			"seed": int(args.seed),
+			"deterministic": bool(want_determinism),
+			"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+			"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
 		},
 	)
 
 	print("[ARTIFACTS]", art.root)
 
-	model = load_erfnet(args.weights, device)
+	model = load_erfnet(args.weights, device=device, mode=args.mode)
 
 	paths = sorted(glob.glob(os.path.expanduser(args.input)))
 	if len(paths) == 0:
@@ -199,7 +230,7 @@ def main():
 			print(f"[SKIP] GT error {path}: {e}")
 			continue
 
-		# skip if no OOD pixel (same as professor scripts typically)
+		# skip if no OOD pixel
 		if 1 not in np.unique(ood):
 			continue
 
@@ -225,8 +256,8 @@ def main():
 	if len(ood_list) == 0:
 		raise RuntimeError("No valid images used (all skipped or without OOD pixels).")
 
-	ood_gts = np.array(ood_list)            # [N,H,W]
-	anomaly_scores = np.array(anomaly_list) # [N,H,W]
+	ood_gts = np.array(ood_list)             # [N,H,W]
+	anomaly_scores = np.array(anomaly_list)  # [N,H,W]
 
 	ood_mask = (ood_gts == 1)
 	in_mask = (ood_gts == 0)
@@ -246,6 +277,8 @@ def main():
 		"method": args.method,
 		"temperature": float(args.temperature),
 		"mode": args.mode,
+		"seed": int(args.seed),
+		"deterministic": bool(want_determinism),
 		"auprc": auprc,
 		"fpr95": fpr95,
 		"auprc_pct": auprc * 100.0,
@@ -254,6 +287,11 @@ def main():
 		"input_glob": args.input,
 		"weights": args.weights,
 		"device": str(device),
+		"resize_h": resize_h,
+		"resize_w": resize_w,
+		"num_classes": NUM_CLASSES,
+		"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+		"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
 	}
 
 	print("=====================================")

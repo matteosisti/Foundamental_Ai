@@ -4,19 +4,6 @@
 # - deterministic control via src.utils.determinism.apply_determinism(mode, seed, deterministic)
 # - artifacts folder auto-run dir + config.json via src.utils.artifacts.create_run_dir
 # - optional caching of RAW logits for temperature sweeps
-#
-# Example:
-#   python3 -m src.runners.run_erfnet_eval \
-#     --input "/content/drive/MyDrive/anom_project/Validation_Dataset/RoadAnomaly21/images/*.*" \
-#     --weights "/content/drive/MyDrive/anom_project/ckpts/erfnet/erfnet_pretrained.pth" \
-#     --dataset-name RA21 \
-#     --method msp \
-#     --temperature 1.0 \
-#     --mode robust \
-#     --seed 0 \
-#     --deterministic \
-#     --artifacts-dir "/content/drive/MyDrive/anom_project/artifacts" \
-#     --save-logits
 
 import os
 import glob
@@ -59,16 +46,9 @@ def _weights_meta(weights_path: str) -> dict:
 
 
 def load_erfnet(weights_path: str, device: torch.device, mode: str) -> torch.nn.Module:
-	"""
-	Mode handling:
-	- robust: fuzzy load (copy matching keys, tolerant to mismatches)
-	- prof-exact: stricter (still strips "module." but prefers exact shapes; strict=False for safety)
-	"""
 	model = ERFNet(NUM_CLASSES).to(device)
 
 	state = torch.load(os.path.expanduser(weights_path), map_location="cpu")
-
-	# Some checkpoints might wrap the state_dict
 	if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
 		state = state["state_dict"]
 
@@ -105,9 +85,14 @@ def gt_path_from_image(path_img: str) -> str:
 	if "LostAndFound" in root or "FS_LostFound_full" in root:
 		return os.path.splitext(root)[0] + ".png"
 
-	# fallback: keep extension if present, else add .png
 	ext = os.path.splitext(root)[1].lower()
 	return root if ext else (root + ".png")
+
+
+def _is_already_binary_ood_mask(uvals: np.ndarray) -> bool:
+	# Typical final format: 0=in, 1=ood, 255=ignore
+	s = set([int(x) for x in uvals.tolist()])
+	return s.issubset({0, 1, 255}) and (1 in s or 0 in s)
 
 
 def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
@@ -115,11 +100,16 @@ def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
 	if "RoadAnomaly" in path_gt:
 		ood = np.where((ood == 2), 1, ood)
 
-	# LostAndFound mapping (common convention in anomaly benchmarks)
+	# LostAndFound:
+	# Some exports already are {0,1,255}. If so: do NOTHING (keep as-is).
+	# Otherwise apply legacy mapping used by older benchmark conversions.
 	if "LostAndFound" in path_gt or "FS_LostFound_full" in path_gt:
-		ood = np.where((ood == 0), 255, ood)
-		ood = np.where((ood == 1), 0, ood)
-		ood = np.where((ood > 1) & (ood < 201), 1, ood)
+		u_before = np.unique(ood)
+		if not _is_already_binary_ood_mask(u_before):
+			# legacy mapping
+			ood = np.where((ood == 0), 255, ood)
+			ood = np.where((ood == 1), 0, ood)
+			ood = np.where((ood > 1) & (ood < 201), 1, ood)
 
 	# StreetHazards mapping (if present)
 	if "Streethazard" in path_gt:
@@ -140,7 +130,6 @@ def load_ood_mask(path_img: str, target_transform) -> np.ndarray:
 
 
 def anomaly_from_logits(logits: torch.Tensor, method: str, T: float) -> np.ndarray:
-	# logits: [1,C,H,W] -> anomaly [H,W]
 	if method == "maxlogit":
 		m = logits.max(dim=1).values
 		return (-m).squeeze(0).detach().cpu().float().numpy()
@@ -181,39 +170,26 @@ def main():
 
 	ap.add_argument("--cpu", action="store_true")
 
-	# Determinism controls
 	ap.add_argument("--seed", type=int, default=0)
-	ap.add_argument(
-		"--deterministic",
-		action="store_true",
-		help="Force deterministic inference (useful to compare logits across runs).",
-	)
+	ap.add_argument("--deterministic", action="store_true")
 
-	# Artifacts
-	ap.add_argument("--artifacts-dir", default="artifacts", help="Root artifacts folder (can be Drive)")
-	ap.add_argument("--save-logits", action="store_true", help="Cache logits+gt for temperature sweep")
-	ap.add_argument("--save-anomaly-maps", action="store_true", help="Save anomaly maps per image (debug)")
+	ap.add_argument("--artifacts-dir", default="artifacts")
+	ap.add_argument("--save-logits", action="store_true")
+	ap.add_argument("--save-anomaly-maps", action="store_true")
 
 	args = ap.parse_args()
 
-	# Default policy:
-	# - robust => deterministic by default
-	# - prof-exact => non-deterministic by default, unless user forces --deterministic
 	if args.mode == "robust":
 		want_determinism = True
 	else:
 		want_determinism = bool(args.deterministic)
-
-	# If user explicitly asked, override
 	if args.deterministic:
 		want_determinism = True
 
-	# IMPORTANT: call before first CUDA ops
 	apply_determinism(mode=args.mode, seed=int(args.seed), deterministic=bool(want_determinism))
 
 	device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
 
-	# fixed transforms
 	resize_h, resize_w = 512, 1024
 	input_transform = Compose([
 		Resize((resize_h, resize_w), Image.BILINEAR),
@@ -223,7 +199,6 @@ def main():
 		Resize((resize_h, resize_w), Image.NEAREST),
 	])
 
-	# Create run dir (+ config.json)
 	extra = {
 		"input_glob": args.input,
 		"resize_h": int(resize_h),
@@ -246,7 +221,6 @@ def main():
 		mode=args.mode,
 		extra=extra,
 	)
-
 	print("[ARTIFACTS]", art.root)
 
 	model = load_erfnet(args.weights, device=device, mode=args.mode)
@@ -262,21 +236,29 @@ def main():
 	gt_cache = []
 	names_cache = []
 
+	# debug: track unique labels seen
+	unique_before_all = set()
+	unique_after_all = set()
+
 	for path in paths:
 		try:
+			path_gt = gt_path_from_image(path)
+			raw = np.array(target_transform(Image.open(path_gt)))
+			unique_before_all.update([int(x) for x in np.unique(raw).tolist()])
+
 			ood = load_ood_mask(path, target_transform=target_transform)
+			unique_after_all.update([int(x) for x in np.unique(ood).tolist()])
 		except Exception as e:
 			print(f"[SKIP] GT error {path}: {e}")
 			continue
 
-		# Skip if no OOD pixels
 		if 1 not in np.unique(ood):
 			continue
 
 		img = Image.open(path).convert("RGB")
 		x = input_transform(img).unsqueeze(0).float().to(device)
 
-		logits = model(x)  # [1,C,H,W]
+		logits = model(x)
 
 		if args.save_logits:
 			logits_cache.append(logits.squeeze(0).detach().cpu().numpy().astype(np.float32))
@@ -293,10 +275,14 @@ def main():
 			np.save(out_map, anomaly.astype(np.float32))
 
 	if len(ood_list) == 0:
-		raise RuntimeError("No valid images used (all skipped or without OOD pixels).")
+		raise RuntimeError(
+			"No valid images used (all skipped or without OOD pixels). "
+			f"mask_unique_before={sorted(list(unique_before_all))} "
+			f"mask_unique_after={sorted(list(unique_after_all))}"
+		)
 
-	ood_gts = np.array(ood_list)             # [N,H,W]
-	anomaly_scores = np.array(anomaly_list)  # [N,H,W]
+	ood_gts = np.array(ood_list)
+	anomaly_scores = np.array(anomaly_list)
 
 	ood_mask = (ood_gts == 1)
 	ind_mask = (ood_gts == 0)
@@ -328,9 +314,13 @@ def main():
 		"device": str(device),
 		"resize_h": int(resize_h),
 		"resize_w": int(resize_w),
+		"gt_h": int(ood_gts.shape[-2]),
+		"gt_w": int(ood_gts.shape[-1]),
 		"num_classes": int(NUM_CLASSES),
 		"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
 		"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+		"mask_unique_before": sorted(list(unique_before_all)),
+		"mask_unique_after": sorted(list(unique_after_all)),
 	}
 
 	print("=====================================")
@@ -340,7 +330,6 @@ def main():
 	print(f"Images used: {metrics['images_used']}")
 	print("=====================================")
 
-	# Save metrics
 	json_path = art.results / "metrics.json"
 	with open(json_path, "w", encoding="utf-8") as f:
 		json.dump(metrics, f, indent=2)
@@ -350,7 +339,6 @@ def main():
 	append_metrics_csv(csv_path, metrics)
 	print(f"[SAVED] {csv_path}")
 
-	# Cache (for sweep)
 	if args.save_logits and len(logits_cache) > 0:
 		np.save(art.logits / f"{args.dataset_name}__logits.npy", np.stack(logits_cache, axis=0))
 		np.save(art.logits / f"{args.dataset_name}__gt.npy", np.stack(gt_cache, axis=0))

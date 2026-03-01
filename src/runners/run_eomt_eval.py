@@ -1,9 +1,12 @@
+# src/runners/run_eomt_eval.py
 import os
 import glob
 import json
 import csv
 import argparse
+from datetime import datetime
 from pathlib import Path
+from typing import Tuple, List
 
 import numpy as np
 from PIL import Image
@@ -13,50 +16,10 @@ import torch.nn.functional as F
 from torchvision.transforms import Compose, Resize, ToTensor
 from sklearn.metrics import average_precision_score
 
-from eval.erfnet import ERFNet
-
+from src.models.eomt_wrapper import EoMTWrapper
 from src.utils.artifacts import create_run_dir
 from src.utils.ood_metrics import fpr_at_95_tpr
 from src.utils.determinism import apply_determinism
-
-
-NUM_CLASSES = 20
-
-
-def load_erfnet(weights_path: str, device: torch.device, mode: str) -> torch.nn.Module:
-	"""
-	Mode handling:
-	- robust: fuzzy load (handles module. prefixes etc)
-	- prof-exact: stricter-ish load (tries to be closer to professor behavior)
-	"""
-	model = ERFNet(NUM_CLASSES).to(device)
-
-	state = torch.load(weights_path, map_location="cpu")
-
-	# Handle checkpoints that may wrap the state_dict
-	if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
-		state = state["state_dict"]
-
-	own = model.state_dict()
-
-	if mode == "prof-exact":
-		# Keep only matching keys (and shapes). Still tolerate module. prefix mismatch.
-		loadable = {}
-		for k, v in state.items():
-			k2 = k.replace("module.", "")
-			if k2 in own and own[k2].shape == v.shape:
-				loadable[k2] = v
-		model.load_state_dict(loadable, strict=False)
-	else:
-		# robust: copy matching tensors into our state dict (most permissive)
-		for k, v in state.items():
-			k2 = k.replace("module.", "")
-			if k2 in own and own[k2].shape == v.shape:
-				own[k2].copy_(v)
-		model.load_state_dict(own, strict=False)
-
-	model.eval()
-	return model
 
 
 def gt_path_from_image(path_img: str) -> str:
@@ -72,23 +35,19 @@ def gt_path_from_image(path_img: str) -> str:
 	if "LostAndFound" in root or "FS_LostFound_full" in root:
 		return os.path.splitext(root)[0] + ".png"
 
-	ext = os.path.splitext(root)[1].lower()
-	return root if ext else (root + ".png")
+	return root
 
 
 def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
-	# RoadAnomaly21: 2 -> OOD
 	if "RoadAnomaly" in path_gt:
 		ood = np.where((ood == 2), 1, ood)
 
-	# LostAndFound / Fishyscapes Lost&Found: remap per common scripts
 	if "LostAndFound" in path_gt or "FS_LostFound_full" in path_gt:
 		ood = np.where((ood == 0), 255, ood)
 		ood = np.where((ood == 1), 0, ood)
 		ood = np.where((ood > 1) & (ood < 201), 1, ood)
 
-	# StreetHazards
-	if "Streethazard" in path_gt or "StreetHazard" in path_gt:
+	if "Streethazard" in path_gt:
 		ood = np.where((ood == 14), 255, ood)
 		ood = np.where((ood < 20), 0, ood)
 		ood = np.where((ood == 255), 1, ood)
@@ -96,32 +55,73 @@ def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
 	return ood
 
 
-def load_ood_mask(path_img: str, target_transform) -> np.ndarray:
+def load_ood_mask(path_img: str, size_hw: Tuple[int, int]) -> np.ndarray:
 	path_gt = gt_path_from_image(path_img)
 	mask = Image.open(path_gt)
-	mask = target_transform(mask)
+	mask = Resize(size_hw, Image.NEAREST)(mask)
 	ood = np.array(mask)
 	ood = remap_ood_mask(path_gt, ood)
 	return ood
 
 
-def anomaly_from_logits(logits: torch.Tensor, method: str, T: float) -> np.ndarray:
-	# logits: [1,C,H,W] -> anomaly [H,W]
-	if method == "maxlogit":
-		m = logits.max(dim=1).values
-		return (-m).squeeze(0).detach().cpu().float().numpy()
+def pixel_probs_from_masks(
+	mask_logits: torch.Tensor,	# [B,Q,h,w]
+	class_logits: torch.Tensor,	# [B,Q,C(+1)]
+	num_classes: int,
+	temperature: float,
+) -> torch.Tensor:
+	if class_logits.shape[-1] == num_classes + 1:
+		class_logits = class_logits[..., :num_classes]
 
-	p = F.softmax(logits / T, dim=1)
+	class_prob = F.softmax(class_logits / temperature, dim=-1)	# [B,Q,C]
+	mask_prob = torch.sigmoid(mask_logits)						# [B,Q,h,w]
 
+	pixel = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)	# [B,C,h,w]
+	den = pixel.sum(dim=1, keepdim=True).clamp_min(1e-8)
+	pixel = pixel / den
+	return pixel
+
+
+def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Tensor:
 	if method == "msp":
-		msp = p.max(dim=1).values
-		return (1.0 - msp).squeeze(0).detach().cpu().float().numpy()
+		msp = pixel_probs.max(dim=1).values
+		return 1.0 - msp
 
 	if method == "maxentropy":
-		ent = -(p * (p.clamp_min(1e-12)).log()).sum(dim=1)
-		return ent.squeeze(0).detach().cpu().float().numpy()
+		ent = -(pixel_probs * pixel_probs.clamp_min(1e-12).log()).sum(dim=1)
+		return ent
+
+	if method == "maxlogit":
+		# proxy: log(prob)
+		logits_proxy = pixel_probs.clamp_min(1e-12).log()
+		m = logits_proxy.max(dim=1).values
+		return -m
 
 	raise ValueError(f"Unknown method: {method}")
+
+
+def rba_from_masks(
+	mask_logits: torch.Tensor,	# [B,Q,h,w]
+	class_logits: torch.Tensor,	# [B,Q,C(+1)]
+	num_classes: int,
+	temperature: float,
+	area_pow: float = 0.5,
+) -> torch.Tensor:
+	if class_logits.shape[-1] == num_classes + 1:
+		class_logits = class_logits[..., :num_classes]
+
+	class_prob = F.softmax(class_logits / temperature, dim=-1)	# [B,Q,C]
+	conf = class_prob.max(dim=-1).values						# [B,Q]
+
+	mask_prob = torch.sigmoid(mask_logits)						# [B,Q,h,w]
+	area = mask_prob.mean(dim=(-2, -1))						# [B,Q]
+
+	reliability = conf * (area.clamp_min(1e-6) ** area_pow)		# [B,Q]
+	reliability = reliability.unsqueeze(-1).unsqueeze(-1)		# [B,Q,1,1]
+
+	normality = (reliability * mask_prob).amax(dim=1)			# [B,h,w]
+	anomaly = 1.0 - normality
+	return anomaly
 
 
 def append_metrics_csv(csv_path: Path, row: dict) -> None:
@@ -138,131 +138,159 @@ def append_metrics_csv(csv_path: Path, row: dict) -> None:
 def main():
 	ap = argparse.ArgumentParser()
 
-	ap.add_argument("--input", required=True, help="Glob images, e.g. /path/images/*.*")
-	ap.add_argument("--weights", required=True, help="Path .pth ERFNet weights")
-	ap.add_argument("--dataset-name", required=True, help="Short dataset name e.g. RA21")
+	ap.add_argument("--input", required=True, help="Glob images, e.g. .../images/*.*")
+	ap.add_argument("--ckpt", required=True, help="EoMT checkpoint (.bin)")
+	ap.add_argument("--config", default="eomt/configs/dinov2/cityscapes/semantic/eomt_base_640.yaml")
 
-	ap.add_argument("--method", choices=["msp", "maxlogit", "maxentropy"], default="msp")
+	ap.add_argument("--dataset-name", required=True, help="Short name: RA21, RO21, FS_STATIC, LAF, ...")
+
+	ap.add_argument("--method", choices=["msp", "maxlogit", "maxentropy", "rba"], default="msp")
 	ap.add_argument("--temperature", type=float, default=1.0)
+	ap.add_argument("--num-classes", type=int, default=19)
+	ap.add_argument("--resize", default=None, help="HxW e.g. 640x640. If None inferred from config filename.")
 	ap.add_argument("--mode", choices=["robust", "prof-exact"], default="robust")
 
-	ap.add_argument("--cpu", action="store_true")
-
-	# Determinism controls
 	ap.add_argument("--seed", type=int, default=0)
-	ap.add_argument(
-		"--deterministic",
-		action="store_true",
-		help="Force deterministic inference (recommended for comparing logits).",
-	)
+	ap.add_argument("--deterministic", action="store_true", help="Force determinism even in prof-exact")
 
-	# Artifacts
-	ap.add_argument("--artifacts-dir", default="artifacts", help="Root artifacts folder (can be Drive)")
-	ap.add_argument("--save-logits", action="store_true", help="Cache logits+gt for temperature sweep")
-	ap.add_argument("--save-anomaly-maps", action="store_true", help="Save anomaly maps per image (debug)")
+	ap.add_argument("--artifacts-dir", default="artifacts")
+	ap.add_argument("--save-logits", action="store_true", help="Cache raw mask/class logits + gt + names for sweep")
+	ap.add_argument("--cpu", action="store_true")
 
 	args = ap.parse_args()
 
-	# Default policy:
-	# - robust => deterministic by default
-	# - prof-exact => non-deterministic by default (closer to typical 'benchmark' style),
-	#                unless user forces deterministic
-	if args.mode == "robust":
-		want_determinism = True
-	else:
-		want_determinism = bool(args.deterministic)
-
-	# If user explicitly passed --deterministic, override
-	if args.deterministic:
-		want_determinism = True
-
-	# Must be called before first CUDA ops (best effort).
-	apply_determinism(seed=int(args.seed), deterministic=bool(want_determinism))
+	apply_determinism(mode=args.mode, seed=args.seed, deterministic=args.deterministic)
 
 	device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
+	print("[device]", device)
 
-	# Fixed ERFNet eval resolution (as used in your runs)
-	resize_h, resize_w = 512, 1024
+	# infer resize
+	if args.resize is None:
+		cfg_lower = os.path.basename(args.config).lower()
+		if "1024" in cfg_lower:
+			H = W = 1024
+		elif "640" in cfg_lower:
+			H = W = 640
+		else:
+			H = W = 640
+	else:
+		hw = args.resize.lower().replace(" ", "").split("x")
+		if len(hw) != 2:
+			raise ValueError("--resize must be like 640x640")
+		H, W = int(hw[0]), int(hw[1])
+
+	size_hw = (H, W)
+
 	input_transform = Compose([
-		Resize((resize_h, resize_w), Image.BILINEAR),
+		Resize(size_hw, Image.BILINEAR),
 		ToTensor(),
 	])
-	target_transform = Compose([
-		Resize((resize_h, resize_w), Image.NEAREST),
-	])
 
-	# Artifacts: create run dir + config dump
+	# create run dir automatically
 	art = create_run_dir(
 		artifacts_root=args.artifacts_dir,
 		dataset=args.dataset_name,
-		model="ERFNet",
+		model="EoMT",
 		method=args.method,
 		temperature=args.temperature,
 		mode=args.mode,
 		extra={
-			"weights": args.weights,
+			"ckpt": args.ckpt,
+			"config": args.config,
 			"input_glob": args.input,
-			"resize_h": resize_h,
-			"resize_w": resize_w,
-			"num_classes": NUM_CLASSES,
-			"device": str(device),
-			"seed": int(args.seed),
-			"deterministic": bool(want_determinism),
-			"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-			"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+			"resize_h": H,
+			"resize_w": W,
+			"num_classes": args.num_classes,
+			"seed": args.seed,
+			"deterministic": bool(args.deterministic),
 		},
 	)
-
 	print("[ARTIFACTS]", art.root)
 
-	model = load_erfnet(args.weights, device=device, mode=args.mode)
+	# init model (same assumptions)
+	backbone = "vit_base_patch14_reg4_dinov2"
+	num_q = 100
+	num_blocks = 3
+	if "large" in os.path.basename(args.config).lower():
+		backbone = "vit_large_patch14_reg4_dinov2"
+
+	model = EoMTWrapper(
+		img_size=size_hw,
+		num_classes=args.num_classes,
+		num_q=num_q,
+		num_blocks=num_blocks,
+		backbone_name=backbone,
+		masked_attn_enabled=True,
+	)
+	model.load(args.ckpt, device)
 
 	paths = sorted(glob.glob(os.path.expanduser(args.input)))
 	if len(paths) == 0:
-		raise FileNotFoundError(f"No images found: {args.input}")
+		raise FileNotFoundError(f"No images found for: {args.input}")
 
-	anomaly_list = []
-	ood_list = []
+	anomaly_list: List[np.ndarray] = []
+	ood_list: List[np.ndarray] = []
+	names: List[str] = []
 
-	logits_cache = []
-	gt_cache = []
-	names_cache = []
+	mask_logits_cache: List[np.ndarray] = []
+	class_logits_cache: List[np.ndarray] = []
 
-	for path in paths:
+	for p in paths:
 		try:
-			ood = load_ood_mask(path, target_transform=target_transform)
+			ood = load_ood_mask(p, size_hw=size_hw)
 		except Exception as e:
-			print(f"[SKIP] GT error {path}: {e}")
+			print(f"[SKIP] GT error {p}: {e}")
 			continue
 
-		# skip if no OOD pixel (common baseline behavior)
 		if 1 not in np.unique(ood):
 			continue
 
-		img = Image.open(path).convert("RGB")
+		img = Image.open(p).convert("RGB")
 		x = input_transform(img).unsqueeze(0).float().to(device)
 
-		logits = model(x)  # [1,C,H,W]
+		mask_logits, class_logits = model.forward_masks_and_classes(x)  # [1,Q,h,w], [1,Q,C(+1)]
+
+		if args.method == "rba":
+			anomaly = rba_from_masks(
+				mask_logits=mask_logits,
+				class_logits=class_logits,
+				num_classes=args.num_classes,
+				temperature=args.temperature,
+			)  # [1,h,w]
+		else:
+			pixel_probs = pixel_probs_from_masks(
+				mask_logits=mask_logits,
+				class_logits=class_logits,
+				num_classes=args.num_classes,
+				temperature=args.temperature,
+			)  # [1,C,h,w]
+			anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)  # [1,h,w]
+
+		# upsample anomaly to input size if needed
+		if anomaly.shape[-2:] != size_hw:
+			anomaly = F.interpolate(
+				anomaly.unsqueeze(1),
+				size=size_hw,
+				mode="bilinear",
+				align_corners=False,
+			).squeeze(1)
+
+		anomaly_np = anomaly.squeeze(0).detach().cpu().float().numpy()
+		anomaly_list.append(anomaly_np)
+		ood_list.append(ood)
+		names.append(os.path.basename(p))
 
 		if args.save_logits:
-			logits_cache.append(logits.squeeze(0).detach().cpu().numpy().astype(np.float32))
-			gt_cache.append(ood.astype(np.uint8))
-			names_cache.append(os.path.basename(path))
+			# cache raw logits (temperature-agnostic)
+			mask_logits_cache.append(mask_logits.squeeze(0).detach().cpu().to(torch.float16).numpy())
+			class_logits_cache.append(class_logits.squeeze(0).detach().cpu().to(torch.float16).numpy())
 
-		anomaly = anomaly_from_logits(logits, args.method, args.temperature)
+	n_used = len(anomaly_list)
+	if n_used == 0:
+		raise RuntimeError("No valid images used (maybe mapping or empty OOD regions).")
 
-		ood_list.append(ood)
-		anomaly_list.append(anomaly)
-
-		if args.save_anomaly_maps:
-			out_map = art.anomaly_maps / f"{os.path.basename(path)}.npy"
-			np.save(out_map, anomaly.astype(np.float32))
-
-	if len(ood_list) == 0:
-		raise RuntimeError("No valid images used (all skipped or without OOD pixels).")
-
-	ood_gts = np.array(ood_list)             # [N,H,W]
-	anomaly_scores = np.array(anomaly_list)  # [N,H,W]
+	ood_gts = np.array(ood_list)
+	anomaly_scores = np.array(anomaly_list)
 
 	ood_mask = (ood_gts == 1)
 	in_mask = (ood_gts == 0)
@@ -277,36 +305,34 @@ def main():
 	fpr95 = float(fpr_at_95_tpr(val_out, val_label, mode=args.mode))
 
 	metrics = {
-		"model": "ERFNet",
+		"timestamp_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+		"model": "EoMT",
 		"dataset": args.dataset_name,
 		"method": args.method,
 		"temperature": float(args.temperature),
 		"mode": args.mode,
+		"num_classes": int(args.num_classes),
+		"resize_h": int(H),
+		"resize_w": int(W),
+		"ckpt": args.ckpt,
+		"config": args.config,
 		"seed": int(args.seed),
-		"deterministic": bool(want_determinism),
+		"deterministic": bool(args.deterministic),
 		"auprc": auprc,
 		"fpr95": fpr95,
 		"auprc_pct": auprc * 100.0,
 		"fpr95_pct": fpr95 * 100.0,
-		"images_used": int(len(ood_list)),
-		"input_glob": args.input,
-		"weights": args.weights,
-		"device": str(device),
-		"resize_h": resize_h,
-		"resize_w": resize_w,
-		"num_classes": NUM_CLASSES,
-		"cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-		"cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+		"images_used": int(n_used),
 	}
 
 	print("=====================================")
-	print(f"ERFNet | dataset={args.dataset_name} | method={args.method} | T={args.temperature} | mode={args.mode}")
+	print(f"EoMT | dataset={args.dataset_name} | method={args.method} | T={args.temperature} | mode={args.mode}")
 	print(f"AUPRC: {metrics['auprc_pct']:.4f}")
 	print(f"FPR@95TPR: {metrics['fpr95_pct']:.4f}")
 	print(f"Images used: {metrics['images_used']}")
+	print(f"Resize: {H}x{W}")
 	print("=====================================")
 
-	# Save metrics
 	json_path = art.results / "metrics.json"
 	with open(json_path, "w", encoding="utf-8") as f:
 		json.dump(metrics, f, indent=2)
@@ -316,14 +342,16 @@ def main():
 	append_metrics_csv(csv_path, metrics)
 	print(f"[SAVED] {csv_path}")
 
-	# Save cache (for sweep)
-	if args.save_logits and len(logits_cache) > 0:
-		np.save(art.logits / f"{args.dataset_name}__logits.npy", np.stack(logits_cache, axis=0))
-		np.save(art.logits / f"{args.dataset_name}__gt.npy", np.stack(gt_cache, axis=0))
+	# cache for sweep
+	if args.save_logits:
+		np.save(art.logits / f"{args.dataset_name}__mask_logits_f16.npy", np.array(mask_logits_cache, dtype=np.float16))
+		np.save(art.logits / f"{args.dataset_name}__class_logits_f16.npy", np.array(class_logits_cache, dtype=np.float16))
+		np.save(art.logits / f"{args.dataset_name}__gt.npy", ood_gts.astype(np.uint8))
 		with open(art.logits / f"{args.dataset_name}__names.json", "w", encoding="utf-8") as f:
-			json.dump(names_cache, f, indent=2)
+			json.dump(names, f, indent=2)
 
-		print(f"[CACHED] {art.logits / f'{args.dataset_name}__logits.npy'}")
+		print(f"[CACHED] {art.logits / f'{args.dataset_name}__mask_logits_f16.npy'}")
+		print(f"[CACHED] {art.logits / f'{args.dataset_name}__class_logits_f16.npy'}")
 		print(f"[CACHED] {art.logits / f'{args.dataset_name}__gt.npy'}")
 		print(f"[CACHED] {art.logits / f'{args.dataset_name}__names.json'}")
 

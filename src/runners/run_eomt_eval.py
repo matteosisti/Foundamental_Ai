@@ -96,11 +96,46 @@ def anomaly_from_pixel_probs(pixel_probs: torch.Tensor, method: str) -> torch.Te
 		return 1.0 - pixel_probs.max(dim=1).values
 	if method == "maxentropy":
 		return -(pixel_probs * pixel_probs.clamp_min(1e-12).log()).sum(dim=1)
-	if method == "maxlogit":
-		logits_proxy = pixel_probs.clamp_min(1e-12).log()
-		return -logits_proxy.max(dim=1).values
+
 	raise ValueError(f"Unknown method: {method}")
 
+def anomaly_maxlogit_from_masks(
+	mask_logits: torch.Tensor,
+	class_logits: torch.Tensor,
+	num_classes: int,
+) -> torch.Tensor:
+	"""
+	MaxLogit anomaly for mask-based models (EoMT / Mask2Former).
+
+	Steps:
+	1. Convert mask logits -> mask probabilities
+	2. Aggregate class logits per pixel using mask probabilities
+	3. Score = 1 - max_c(logit_c(x))
+
+	Shapes:
+		mask_logits:  [B, Q, H, W]
+		class_logits: [B, Q, C] or [B, Q, C+1]
+
+	Return:
+		anomaly: [B, H, W]
+	"""
+
+	# remove "no-object" class if present
+	if class_logits.shape[-1] == num_classes + 1:
+		class_logits = class_logits[..., :num_classes]
+
+	# mask probabilities
+	mask_prob = torch.sigmoid(mask_logits)  # [B,Q,H,W]
+
+	# aggregate logits per pixel
+	pixel_logits = torch.einsum(
+		"bqc,bqhw->bchw",
+		class_logits,
+		mask_prob
+	)  # [B,C,H,W]
+
+	# anomaly score
+	return 1.0 - pixel_logits.max(dim=1).values
 
 def rba_from_masks(mask_logits: torch.Tensor, class_logits: torch.Tensor, num_classes: int, temperature: float, area_pow: float = 0.5) -> torch.Tensor:
 	if class_logits.shape[-1] == num_classes + 1:
@@ -268,6 +303,8 @@ def main():
 
 		if args.method == "rba":
 			anomaly = rba_from_masks(mask_logits, class_logits, args.num_classes, args.temperature)
+		elif args.method == "maxlogit":
+			anomaly = anomaly_maxlogit_from_masks(mask_logits, class_logits, args.num_classes)
 		else:
 			pixel_probs = pixel_probs_from_masks(mask_logits, class_logits, args.num_classes, args.temperature)
 			anomaly = anomaly_from_pixel_probs(pixel_probs, args.method)

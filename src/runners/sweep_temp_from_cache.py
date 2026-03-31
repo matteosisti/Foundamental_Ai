@@ -1,19 +1,17 @@
 # src/runners/sweep_temp_from_cache.py
 #
-# Temperature sweep for ERFNet using cached logits.
-# Run-dir naming: 2026-03-01_12-28-22__msp__T1.0__robust__559e7ee5
+# Offline temperature sweep for ERFNet using cached logits.
+# No model forward pass needed — loads logits saved by run_erfnet_eval.py.
 #
-# Cache files expected (from run_erfnet_eval.py):
-#   logits/<DATASET>__logits.npy   [N,C,H,W] float32
-#   logits/<DATASET>__gt.npy       [N,H,W]   uint8
+# Expected cache files (written by run_erfnet_eval.py --save-logits):
+#   logits/<DATASET>__logits.npy   [N, C, H, W]  float32
+#   logits/<DATASET>__gt.npy       [N, H, W]     uint8
 
 import os
-import re
 import json
 import csv
 import argparse
 from pathlib import Path
-from typing import Optional, List, Tuple
 
 import numpy as np
 import torch
@@ -22,221 +20,167 @@ from sklearn.metrics import average_precision_score
 
 from src.utils.ood_metrics import fpr_at_95_tpr
 from src.utils.determinism import apply_determinism
+from src.utils.artifacts import resolve_latest_run_dir_filtered
 
 
-RUN_RE = re.compile(
-	r"^(?P<ts>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})"
-	r"__"
-	r"(?P<method>[a-zA-Z0-9\-]+)"
-	r"__T(?P<T>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
-	r"__"
-	r"(?P<mode>robust|prof-exact)"
-	r"__"
-	r"(?P<hash>[0-9a-fA-F]+)$"
-)
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def append_metrics_csv(csv_path: Path, row: dict) -> None:
-	write_header = not csv_path.exists()
-	fieldnames = list(row.keys())
-	with open(csv_path, "a", newline="") as f:
-		writer = csv.DictWriter(f, fieldnames=fieldnames)
-		if write_header:
-			writer.writeheader()
-		writer.writerow(row)
+    write_header = not csv_path.exists()
+    fieldnames = list(row.keys())
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
-def parse_run_dir_name(name: str) -> Optional[dict]:
-	m = RUN_RE.match(name)
-	if not m:
-		return None
-	d = m.groupdict()
-	return {
-		"ts": d["ts"],
-		"method": d["method"].lower(),
-		"T": float(d["T"]),
-		"mode": d["mode"].lower(),
-		"hash": d["hash"].lower(),
-	}
-
-
-def find_latest_run_dir(
-	artifacts_root: str,
-	dataset: str,
-	model: str,
-	method: str,
-	mode: str,
-	require_logits: bool = True,
-) -> Path:
-	root = Path(os.path.expanduser(artifacts_root))
-	base = root / dataset / model
-	if not base.exists():
-		raise FileNotFoundError(f"Base artifacts folder not found: {base}")
-
-	method = method.lower().strip()
-	mode = mode.lower().strip()
-
-	candidates: List[Tuple[str, Path]] = []
-
-	for run_dir in base.iterdir():
-		if not run_dir.is_dir():
-			continue
-		info = parse_run_dir_name(run_dir.name)
-		if info is None:
-			continue
-		if info["method"] != method:
-			continue
-		if info["mode"] != mode:
-			continue
-
-		if require_logits:
-			logits_dir = run_dir / "logits"
-			l_path = logits_dir / f"{dataset}__logits.npy"
-			g_path = logits_dir / f"{dataset}__gt.npy"
-			if not l_path.exists() or not g_path.exists():
-				continue
-
-		candidates.append((info["ts"], run_dir))
-
-	if not candidates:
-		raise FileNotFoundError(
-			f"No matching runs found in {base} for method={method}, mode={mode} (require_logits={require_logits})."
-		)
-
-	candidates.sort(key=lambda x: x[0], reverse=True)
-	return candidates[0][1]
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-	ap = argparse.ArgumentParser(description="Temperature sweep from cached ERFNet logits (CPU/GPU).")
-	ap.add_argument("--dataset-name", required=True, help="e.g. RA21")
-	ap.add_argument("--artifacts-dir", default="artifacts", help="Root artifacts folder")
+    ap = argparse.ArgumentParser(
+        description="Offline temperature sweep from cached ERFNet logits."
+    )
 
-	ap.add_argument("--mode", choices=["robust", "prof-exact"], required=True)
-	ap.add_argument("--method", choices=["msp", "maxentropy", "maxlogit"], required=True)
+    ap.add_argument("--dataset-name",  required=True, help="e.g. RA21, RO21, LAF")
+    ap.add_argument("--artifacts-dir", default="artifacts")
 
-	ap.add_argument("--temperatures", default="0.5,0.75,1.0,1.1,1.25,1.5,2.0", help="comma-separated")
+    ap.add_argument("--mode",   choices=["robust", "prof-exact"], required=True)
+    ap.add_argument("--method", choices=["msp", "maxentropy", "maxlogit"], required=True)
 
-	ap.add_argument("--use-latest", action="store_true")
-	ap.add_argument("--run-dir", default=None)
+    ap.add_argument("--temperatures", default="0.5,0.75,1.0,1.1,1.25,1.5,2.0",
+                    help="Comma-separated list of temperatures to evaluate")
 
-	# NEW: device + determinism
-	ap.add_argument("--device", choices=["cpu", "cuda"], default=None, help="Default: cuda if available")
-	ap.add_argument("--seed", type=int, default=0)
-	ap.add_argument("--deterministic", action="store_true", help="Force deterministic ops (debug/repro)")
+    ap.add_argument("--use-latest", action="store_true",
+                    help="Auto-resolve most recent matching run dir with logits")
+    ap.add_argument("--run-dir", default=None,
+                    help="Explicit path to a run dir (overrides --use-latest)")
 
-	args = ap.parse_args()
+    ap.add_argument("--device",        choices=["cpu", "cuda"], default=None)
+    ap.add_argument("--seed",          type=int,  default=0)
+    ap.add_argument("--deterministic", action="store_true")
 
-	# Determinism policy: we keep same semantics as runners
-	apply_determinism(mode=args.mode, seed=int(args.seed), deterministic=bool(args.deterministic))
+    args = ap.parse_args()
 
-	T_list = [float(x.strip()) for x in args.temperatures.split(",") if x.strip()]
+    apply_determinism(mode=args.mode, seed=int(args.seed), deterministic=bool(args.deterministic))
 
-	# device resolution
-	if args.device is None:
-		device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	else:
-		device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
+    T_list = [float(x.strip()) for x in args.temperatures.split(",") if x.strip()]
 
-	# Resolve run directory
-	if args.run_dir is not None:
-		run_root = Path(os.path.expanduser(args.run_dir))
-	else:
-		if not args.use_latest:
-			raise ValueError("Provide --run-dir or use --use-latest")
-		run_root = find_latest_run_dir(
-			artifacts_root=args.artifacts_dir,
-			dataset=args.dataset_name,
-			model="ERFNet",
-			method=args.method,
-			mode=args.mode,
-			require_logits=True,
-		)
+    if args.device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
 
-	logits_dir = run_root / "logits"
-	sweep_dir = run_root / "sweep" / f"{args.method}__{args.mode}"
-	sweep_dir.mkdir(parents=True, exist_ok=True)
-	csv_path = sweep_dir / "metrics_sweep.csv"
+    # Resolve run directory
+    if args.run_dir is not None:
+        run_root = Path(os.path.expanduser(args.run_dir))
+    else:
+        if not args.use_latest:
+            raise ValueError("Provide --run-dir or pass --use-latest.")
+        ds = args.dataset_name
+        run_root = resolve_latest_run_dir_filtered(
+            artifacts_root=args.artifacts_dir,
+            dataset=ds,
+            model="ERFNet",
+            method=args.method,
+            mode=args.mode,
+            require_logits=True,
+            logit_files=[f"{ds}__logits.npy", f"{ds}__gt.npy"],
+        )
 
-	l_path = logits_dir / f"{args.dataset_name}__logits.npy"
-	g_path = logits_dir / f"{args.dataset_name}__gt.npy"
+    print(f"[ARTIFACTS] {run_root}")
 
-	if not l_path.exists() or not g_path.exists():
-		raise FileNotFoundError(f"Missing cache files: {l_path} or {g_path}")
+    # Locate cached logits
+    logits_dir = run_root / "logits"
+    ds         = args.dataset_name
+    l_path     = logits_dir / f"{ds}__logits.npy"
+    g_path     = logits_dir / f"{ds}__gt.npy"
 
-	# Load cache (CPU numpy)
-	logits = np.load(l_path)  # [N,C,H,W]
-	gt = np.load(g_path)      # [N,H,W]
+    for p in [l_path, g_path]:
+        if not p.exists():
+            raise FileNotFoundError(f"Missing cache file: {p}")
 
-	ood_mask = (gt == 1)
-	ind_mask = (gt == 0)
-	if ood_mask.sum() == 0 or ind_mask.sum() == 0:
-		raise RuntimeError("GT has no OOD or no InD pixels. Check remapping.")
+    # Load — move to device ONCE
+    logits = np.load(l_path)  # [N, C, H, W] float32
+    gt     = np.load(g_path)  # [N, H, W]    uint8
 
-	# Torch tensor -> move to device ONCE
-	logits_t = torch.from_numpy(logits).to(device=device, dtype=torch.float32)
+    ood_mask = (gt == 1)
+    ind_mask = (gt == 0)
+    if ood_mask.sum() == 0 or ind_mask.sum() == 0:
+        raise RuntimeError("GT has no OOD or no InD pixels — check remapping / dataset.")
 
-	for T in T_list:
-		Tv = float(T)
+    logits_t = torch.from_numpy(logits).to(device=device, dtype=torch.float32)
 
-		if args.method == "msp":
-			p = F.softmax(logits_t / Tv, dim=1)              # [N,C,H,W]
-			m = torch.max(p, dim=1).values                   # [N,H,W]
-			anomaly_t = (1.0 - m)
+    # Output dir
+    sweep_dir = run_root / "sweep" / f"{args.method}__{args.mode}"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+    csv_path_out = sweep_dir / "metrics_sweep.csv"
 
-		elif args.method == "maxentropy":
-			p = F.softmax(logits_t / Tv, dim=1)
-			anomaly_t = -(p * torch.clamp_min(p, 1e-12).log()).sum(dim=1)
+    # Temperature sweep
+    for T in T_list:
+        Tv = float(T)
 
-		elif args.method == "maxlogit":
-			m = torch.max(logits_t / Tv, dim=1).values
-			anomaly_t = -m
+        if args.method == "msp":
+            p         = F.softmax(logits_t / Tv, dim=1)
+            anomaly_t = 1.0 - p.max(dim=1).values
 
-		else:
-			raise ValueError(f"Unknown method: {args.method}")
+        elif args.method == "maxentropy":
+            p         = F.softmax(logits_t / Tv, dim=1)
+            anomaly_t = -(p * p.clamp_min(1e-12).log()).sum(dim=1)
 
-		# Back to CPU numpy for masking + sklearn
-		anomaly = anomaly_t.detach().cpu().numpy()
+        elif args.method == "maxlogit":
+            # Temperature has no effect on MaxLogit by definition
+            # (operates on raw pre-softmax logits)
+            anomaly_t = -logits_t.max(dim=1).values
 
-		ood_out = anomaly[ood_mask]
-		ind_out = anomaly[ind_mask]
+        else:
+            raise ValueError(f"Unknown method: {args.method}")
 
-		val_out = np.concatenate([ind_out, ood_out])
-		val_label = np.concatenate([np.zeros(len(ind_out)), np.ones(len(ood_out))])
+        anomaly = anomaly_t.detach().cpu().numpy()
 
-		auprc = float(average_precision_score(val_label, val_out))
-		fpr95 = float(fpr_at_95_tpr(val_out, val_label, mode=args.mode))
+        ood_out = anomaly[ood_mask]
+        ind_out = anomaly[ind_mask]
 
-		res = {
-			"model": "ERFNet",
-			"dataset": args.dataset_name,
-			"method": args.method,
-			"temperature": Tv,
-			"mode": args.mode,
-			"auprc": auprc,
-			"fpr95": fpr95,
-			"auprc_pct": auprc * 100.0,
-			"fpr95_pct": fpr95 * 100.0,
-			"images_used": int(logits.shape[0]),
-			"gt_h": int(gt.shape[-2]),
-			"gt_w": int(gt.shape[-1]),
-			"device": str(device),
-			"seed": int(args.seed),
-			"deterministic": bool(args.deterministic),
-			"source": "logits_cache",
-			"run_dir": str(run_root),
-		}
+        val_out   = np.concatenate([ind_out, ood_out])
+        val_label = np.concatenate([np.zeros(len(ind_out)), np.ones(len(ood_out))])
 
-		out_json = sweep_dir / f"T{Tv}__metrics.json"
-		with open(out_json, "w", encoding="utf-8") as f:
-			json.dump(res, f, indent=2)
+        auprc = float(average_precision_score(val_label, val_out))
+        fpr95 = float(fpr_at_95_tpr(val_out, val_label, mode=args.mode))
 
-		append_metrics_csv(csv_path, res)
-		print(f"[T={Tv}] AUPRC={res['auprc_pct']:.4f} | FPR95={res['fpr95_pct']:.4f} | saved {out_json}")
+        metrics = {
+            "model":         "ERFNet",
+            "dataset":       args.dataset_name,
+            "method":        args.method,
+            "temperature":   Tv,
+            "mode":          args.mode,
+            "auprc":         auprc,
+            "fpr95":         fpr95,
+            "auprc_pct":     auprc * 100.0,
+            "fpr95_pct":     fpr95 * 100.0,
+            "images_used":   int(logits.shape[0]),
+            "gt_h":          int(gt.shape[-2]),
+            "gt_w":          int(gt.shape[-1]),
+            "device":        str(device),
+            "seed":          int(args.seed),
+            "deterministic": bool(args.deterministic),
+            "source":        "logits_cache",
+            "run_dir":       str(run_root),
+        }
 
-	print(f"[DONE] device={device} | Run used: {run_root}")
-	print(f"[DONE] Sweep results in: {sweep_dir}")
+        out_json = sweep_dir / f"T{Tv}__metrics.json"
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+
+        append_metrics_csv(csv_path_out, metrics)
+        print(f"[T={Tv}] AUPRC={metrics['auprc_pct']:.4f} | FPR95={metrics['fpr95_pct']:.4f} | saved {out_json}")
+
+    print(f"[DONE] Run used: {run_root}")
+    print(f"[DONE] Sweep results in: {sweep_dir}")
 
 
 if __name__ == "__main__":
-	main()
+    main()

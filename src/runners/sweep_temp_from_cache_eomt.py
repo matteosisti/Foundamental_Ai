@@ -73,12 +73,13 @@ def main():
     ap.add_argument("--mode",   choices=["robust", "prof-exact"], required=True)
     ap.add_argument("--method", choices=["msp", "maxentropy", "maxlogit", "rba"], required=True)
 
-    ap.add_argument("--num-classes",  type=int, default=19)
+    ap.add_argument("--num-classes",  type=int, default=20,
+                    help="Must match checkpoint output dim. eomt_cityscapes.bin has 20 (19 Cityscapes + no-object).")
     ap.add_argument("--temperatures", default="0.5,0.75,1.0,1.1,1.25,1.5,2.0",
                     help="Comma-separated list of temperatures to evaluate")
 
     ap.add_argument("--use-latest", action="store_true",
-                    help="Auto-resolve most recent matching run dir")
+                    help="Auto-resolve most recent matching run dir with logits")
     ap.add_argument("--run-dir", default=None,
                     help="Explicit path to a run dir (overrides --use-latest)")
 
@@ -103,12 +104,19 @@ def main():
     else:
         if not args.use_latest:
             raise ValueError("Provide --run-dir or pass --use-latest.")
+        ds = args.dataset_name
         run_root = resolve_latest_run_dir_filtered(
             artifacts_root=args.artifacts_dir,
-            dataset=args.dataset_name,
+            dataset=ds,
             model="EoMT",
             method=args.method,
             mode=args.mode,
+            require_logits=True,
+            logit_files=[
+                f"{ds}__mask_logits_f16.npy",
+                f"{ds}__class_logits_f16.npy",
+                f"{ds}__gt.npy",
+            ],
         )
 
     print(f"[ARTIFACTS] {run_root}")
@@ -148,7 +156,7 @@ def main():
     logits_h = int(mask_t.shape[-2])
     logits_w = int(mask_t.shape[-1])
 
-    # Output dir for sweep results
+    # Output dir
     sweep_dir = run_root / "sweep" / f"{args.method}__{args.mode}"
     sweep_dir.mkdir(parents=True, exist_ok=True)
     csv_path_out = sweep_dir / "metrics_sweep.csv"
@@ -161,18 +169,17 @@ def main():
             anomaly_t = rba_from_masks(mask_t, class_t, args.num_classes, Tv)
 
         elif args.method == "maxlogit":
-            # NOTE: MaxLogit operates on raw logits — temperature has no effect
-            # by definition (logits are pre-softmax). We call the correct function
-            # that aggregates class logits weighted by mask probs, NOT log(pixel_probs).
+            # Temperature has no effect on MaxLogit by definition
+            # (operates on raw pre-softmax logits, not on pixel_probs)
             anomaly_t = anomaly_maxlogit_from_masks(mask_t, class_t, args.num_classes)
 
         else:
-            # msp / maxentropy path — temperature scaling applied via softmax
+            # msp / maxentropy — temperature scaling via softmax
             pixel_probs = pixel_probs_from_masks(mask_t, class_t, args.num_classes, Tv)
             anomaly_t   = anomaly_from_pixel_probs(pixel_probs, args.method)
 
         # Upsample to GT resolution if logits are at lower resolution
-        anomaly_t = upsample_to_gt(anomaly_t, (gt_H, gt_W))  # [N, H, W]
+        anomaly_t = upsample_to_gt(anomaly_t, (gt_H, gt_W))
         anomaly   = anomaly_t.detach().cpu().numpy()
 
         ood_out = anomaly[ood_mask]

@@ -60,8 +60,10 @@ def main():
 
     ap.add_argument("--method",      choices=["msp", "maxlogit", "maxentropy", "rba"], default="msp")
     ap.add_argument("--temperature", type=float, default=1.0)
-    ap.add_argument("--num-classes", type=int,   default=20,
-                    help="Must match checkpoint output dim. eomt_cityscapes.bin has 20 (19 Cityscapes + no-object).")
+    ap.add_argument("--num-classes", type=int,   default=19,
+                    help="Cityscapes semantic classes. EoMT adds +1 no-object internally, "
+                         "so class_head shape = (num_classes+1, 768). "
+                         "eomt_cityscapes.bin has class_head=(20,768) → num_classes=19 is correct.")
     ap.add_argument("--resize",      default=None,
                     help="Override input resolution, e.g. 1024x1024")
     ap.add_argument("--mode",        choices=["robust", "prof-exact"], default="robust")

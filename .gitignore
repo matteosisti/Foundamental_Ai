@@ -22,5 +22,4 @@ Thumbs.db
 *.npy
 
 # post edit cleanup
-src/utils/eomt_post.py
 *.zip 

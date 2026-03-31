@@ -1,30 +1,73 @@
+"""
+src/utils/artifacts.py
+
+Artifact management: run directory creation, config saving, and
+run discovery for offline temperature sweeps.
+
+Public API:
+    create_run_dir                  — create timestamped run folder + config.json
+    update_run_config               — patch an existing config.json
+    resolve_latest_run_dir          — find most recent run for a model/dataset
+    resolve_latest_run_dir_filtered — find most recent run matching method/mode,
+                                      optionally checking that logit cache files exist
+"""
+
 import os
+import re
 import json
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Run directory naming — shared regex (used by both ERFNet and EoMT sweeps)
+# Format: YYYY-MM-DD_HH-MM-SS__method__T<float>__mode__<hash8>
+# ---------------------------------------------------------------------------
+
+RUN_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})"
+    r"__"
+    r"(?P<method>[a-zA-Z0-9\-]+)"
+    r"__T(?P<T>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+    r"__"
+    r"(?P<mode>robust|prof-exact)"
+    r"__"
+    r"(?P<hash>[0-9a-fA-F]+)$"
+)
+
+
+# ---------------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ArtifactPaths:
     """
-    Data container for run-specific directories.
+    Run-specific directory layout.
     Ensures consistent path resolution across evaluation and sweep stages.
     """
-    root: Path
-    results: Path
-    logits: Path
+    root:         Path
+    results:      Path
+    logits:       Path
     anomaly_maps: Path
-    sweep: Path
+    sweep:        Path
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def _short_hash(payload: Dict[str, Any], n: int = 8) -> str:
-    """Generates a stable short hash from the run configuration."""
+    """Stable short hash from a run config dict."""
     s = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha1(s).hexdigest()[:n]
 
+
 def _sha256_file_8(path: str, chunk_size: int = 1024 * 1024) -> str:
-    """Returns the first 8 characters of the sha256 hash for a given file."""
+    """First 8 chars of the SHA-256 hash of a file (for checkpoint lineage)."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while True:
@@ -34,32 +77,73 @@ def _sha256_file_8(path: str, chunk_size: int = 1024 * 1024) -> str:
             h.update(b)
     return h.hexdigest()[:8]
 
+
 def _normalize_float(x: Optional[float]) -> Optional[float]:
-    if x is None:
-        return None
-    return float(x)
+    return None if x is None else float(x)
+
 
 def _list_run_dirs(base: Path) -> List[Path]:
-    """Helper to list all subdirectories in a model-specific folder."""
+    """All subdirectories under base (non-recursive)."""
     if not base.exists():
         return []
     return [p for p in base.iterdir() if p.is_dir()]
 
+
+def _parse_run_dir_name(name: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse a run directory name into its components using RUN_RE.
+    Returns None if the name does not match the expected format.
+    """
+    m = RUN_RE.match(name)
+    if not m:
+        return None
+    d = m.groupdict()
+    return {
+        "ts":     d["ts"],
+        "method": d["method"].lower(),
+        "T":      float(d["T"]),
+        "mode":   d["mode"].lower(),
+        "hash":   d["hash"].lower(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Run directory creation
+# ---------------------------------------------------------------------------
+
 def create_run_dir(
     artifacts_root: str,
-    dataset: str,
-    model: str,
-    method: str,
-    temperature: Optional[float],
-    mode: str,
-    extra: Optional[Dict[str, Any]] = None,
-    timestamp: Optional[str] = None,
-    hash_files: Optional[Dict[str, str]] = None,
-    name_style: str = "pretty",
+    dataset:        str,
+    model:          str,
+    method:         str,
+    temperature:    Optional[float],
+    mode:           str,
+    extra:          Optional[Dict[str, Any]] = None,
+    timestamp:      Optional[str] = None,
+    hash_files:     Optional[Dict[str, str]] = None,
+    name_style:     str = "pretty",
 ) -> ArtifactPaths:
     """
-    Creates a unique, timestamped directory for each experiment run.
-    Also saves a config.json for full experiment reproducibility.
+    Creates a unique timestamped directory for an experiment run and saves
+    a config.json for full reproducibility.
+
+    Directory name format (name_style='pretty'):
+        <timestamp>__<method>__T<temperature>__<mode>__<hash8>
+
+    Args:
+        artifacts_root : root folder for all artifacts
+        dataset        : dataset identifier (e.g. 'RA21')
+        model          : model name (e.g. 'EoMT', 'ERFNet')
+        method         : anomaly method (e.g. 'msp', 'rba')
+        temperature    : temperature value (None -> 'NA' in folder name)
+        mode           : 'robust' or 'prof-exact'
+        extra          : additional fields merged into config.json
+        timestamp      : override auto-generated timestamp
+        hash_files     : dict of {key: filepath} to hash for lineage tracking
+        name_style     : 'pretty' (default) or 'compact'
+
+    Returns:
+        ArtifactPaths with .root, .results, .logits, .anomaly_maps, .sweep
     """
     root = Path(os.path.expanduser(artifacts_root))
 
@@ -67,19 +151,17 @@ def create_run_dir(
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     meta: Dict[str, Any] = {
-        "dataset": dataset,
-        "model": model,
-        "method": method,
+        "dataset":     dataset,
+        "model":       model,
+        "method":      method,
         "temperature": _normalize_float(temperature),
-        "mode": mode,
+        "mode":        mode,
     }
-
     if extra:
         meta.update(extra)
 
-    # Add file hashes (e.g., checkpoints) for lineage tracking
     if hash_files:
-        hash_block = {}
+        hash_block: Dict[str, Any] = {}
         for k, p in hash_files.items():
             if p is None:
                 hash_block[k] = None
@@ -93,9 +175,8 @@ def create_run_dir(
         meta.update(hash_block)
 
     run_id = _short_hash(meta)
-    T_str = "NA" if temperature is None else str(float(temperature))
+    T_str  = "NA" if temperature is None else str(float(temperature))
 
-    # Define the folder name using a consistent naming convention
     if name_style == "pretty":
         run_name = f"{timestamp}__{method}__T{T_str}__{mode}__{run_id}"
     else:
@@ -104,80 +185,119 @@ def create_run_dir(
     run_root = root / dataset / model / run_name
 
     paths = ArtifactPaths(
-        root=run_root,
-        results=run_root / "results",
-        logits=run_root / "logits",
+        root=        run_root,
+        results=     run_root / "results",
+        logits=      run_root / "logits",
         anomaly_maps=run_root / "anomaly_maps",
-        sweep=run_root / "sweep",
+        sweep=       run_root / "sweep",
     )
 
-    # Create directories physically on disk
     for p in [paths.root, paths.results, paths.logits, paths.anomaly_maps, paths.sweep]:
         p.mkdir(parents=True, exist_ok=True)
 
-    # Save the configuration for auditing
     with open(paths.root / "config.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
     return paths
 
+
+# ---------------------------------------------------------------------------
+# Config patching
+# ---------------------------------------------------------------------------
+
 def update_run_config(run_root: Path, patch: Dict[str, Any]) -> None:
-    """Updates <run_root>/config.json by merging a patch dictionary."""
+    """Merge a patch dict into an existing <run_root>/config.json."""
     run_root = Path(run_root)
     cfg = run_root / "config.json"
     if not cfg.exists():
         raise FileNotFoundError(f"Missing config.json in: {run_root}")
-
     with open(cfg, "r", encoding="utf-8") as f:
         data = json.load(f)
-
     data.update(patch)
-
     with open(cfg, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-def resolve_latest_run_dir(artifacts_root: str, dataset: str, model: str) -> Path:
-    """Automated discovery of the most recent experiment based on timestamp."""
+
+# ---------------------------------------------------------------------------
+# Run discovery
+# ---------------------------------------------------------------------------
+
+def resolve_latest_run_dir(
+    artifacts_root: str,
+    dataset:        str,
+    model:          str,
+) -> Path:
+    """Return the most recent run directory for a given model/dataset."""
     base = Path(os.path.expanduser(artifacts_root)) / dataset / model
     runs = _list_run_dirs(base)
-
-    if len(runs) == 0:
+    if not runs:
         raise FileNotFoundError(f"No runs found in: {base}")
+    return sorted(runs, key=lambda p: p.name)[-1]
 
-    # Lexicographical sort on ISO timestamps ensures the last run is selected
-    runs = sorted(runs, key=lambda p: p.name)
-    return runs[-1]
 
 def resolve_latest_run_dir_filtered(
     artifacts_root: str,
-    dataset: str,
-    model: str,
-    method: Optional[str] = None,
-    mode: Optional[str] = None,
+    dataset:        str,
+    model:          str,
+    method:         Optional[str] = None,
+    mode:           Optional[str] = None,
+    require_logits: bool = False,
+    logit_files:    Optional[List[str]] = None,
 ) -> Path:
     """
-    Discovery tool that filters by method/mode from the folder name.
-    Critical for matching sweep logic to the correct cached logits.
+    Find the most recent run directory matching method and mode,
+    optionally verifying that required logit cache files exist on disk.
+
+    Args:
+        artifacts_root : root artifacts folder
+        dataset        : dataset identifier (e.g. 'RA21')
+        model          : model name (e.g. 'EoMT', 'ERFNet')
+        method         : filter by anomaly method (None = any)
+        mode           : filter by mode (None = any)
+        require_logits : if True, skip runs whose logits/ folder is missing
+                         the files listed in logit_files
+        logit_files    : list of filenames to check inside logits/
+                         (e.g. ['RA21__logits.npy', 'RA21__gt.npy'])
+                         ignored when require_logits=False
+
+    Returns:
+        Path to the most recent matching run directory.
+
+    Raises:
+        FileNotFoundError if no matching run is found.
     """
     base = Path(os.path.expanduser(artifacts_root)) / dataset / model
-    runs = _list_run_dirs(base)
-    
-    if len(runs) == 0:
-        raise FileNotFoundError(f"No runs found in: {base}")
+    if not base.exists():
+        raise FileNotFoundError(f"Artifacts base folder not found: {base}")
 
-    def matches(p: Path) -> bool:
-        name = p.name
-        if method is not None and f"__{method}__" not in name:
-            return False
-        if mode is not None and f"__{mode}__" not in name:
-            return False
-        return True
+    method_f = method.lower().strip() if method else None
+    mode_f   = mode.lower().strip()   if mode   else None
 
-    filtered_runs = [p for p in runs if matches(p)]
-    
-    if len(filtered_runs) == 0:
-        raise FileNotFoundError(f"No runs matching method={method} mode={mode} in: {base}")
+    candidates: List[Tuple[str, Path]] = []
 
-    # Return the most recent run among the filtered ones
-    filtered_runs = sorted(filtered_runs, key=lambda p: p.name)
-    return filtered_runs[-1]
+    for run_dir in _list_run_dirs(base):
+        info = _parse_run_dir_name(run_dir.name)
+        if info is None:
+            continue
+        if method_f is not None and info["method"] != method_f:
+            continue
+        if mode_f is not None and info["mode"] != mode_f:
+            continue
+
+        # Optionally verify that logit cache files are present
+        if require_logits and logit_files:
+            logits_dir = run_dir / "logits"
+            if not all((logits_dir / f).exists() for f in logit_files):
+                continue
+
+        candidates.append((info["ts"], run_dir))
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No matching run found in {base} "
+            f"for method={method}, mode={mode}, require_logits={require_logits}."
+        )
+
+    # Most recent by timestamp (lexicographic sort is safe with ISO format)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]

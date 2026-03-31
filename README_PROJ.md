@@ -139,16 +139,6 @@ This ensures reproducibility and easy extension to newer models like EoMT.
 
 ---
 
-### Current Status
-- [x] ERFNet baseline implemented
-- [x] MSP / MaxLogit / MaxEntropy
-- [x] Logit caching system
-- [x] Temperature scaling sweep
-- [x] Drive-based artifact management
-- [x] Clean GitHub repo (no heavy files)
-
----
-
 ### Next Steps
 - Implement EoMT evaluation
 - Add RbA scoring

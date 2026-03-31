@@ -73,8 +73,9 @@ def main():
     ap.add_argument("--mode",   choices=["robust", "prof-exact"], required=True)
     ap.add_argument("--method", choices=["msp", "maxentropy", "maxlogit", "rba"], required=True)
 
-    ap.add_argument("--num-classes",  type=int, default=20,
-                    help="Must match checkpoint output dim. eomt_cityscapes.bin has 20 (19 Cityscapes + no-object).")
+    ap.add_argument("--num-classes",  type=int, default=19,
+                    help="Must match runner setting. EoMT adds +1 no-object internally: "
+                         "num_classes=19 → class_head=(20,768) matches eomt_cityscapes.bin.")
     ap.add_argument("--temperatures", default="0.5,0.75,1.0,1.1,1.25,1.5,2.0",
                     help="Comma-separated list of temperatures to evaluate")
 

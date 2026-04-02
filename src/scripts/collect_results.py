@@ -20,11 +20,15 @@ MODELS    = ["ERFNet", "EoMT"]
 METHODS   = ["msp", "maxentropy", "maxlogit", "rba"]
 
 
+def _resolve_timestamp(m: dict, folder_name: str) -> str:
+    ts = m.get("timestamp_utc")
+    if ts:
+        return ts
+    # Fallback: extract from folder name "2026-03-31_11-03-26__msp__..."
+    return folder_name[:19].replace("_", "T", 1)  # "2026-03-31T11-03-26"
+
+
 def collect(artifacts_root: str) -> dict:
-    """
-    Walks artifacts/<dataset>/<model>/<run>/results/metrics.json
-    Returns nested dict: results[dataset][model][method] = metrics dict
-    """
     results = defaultdict(lambda: defaultdict(dict))
     root = Path(artifacts_root)
 
@@ -39,20 +43,21 @@ def collect(artifacts_root: str) -> dict:
         dataset = m.get("dataset") or metrics_path.parts[-4]
         model   = m.get("model")   or metrics_path.parts[-3]
         method  = m.get("method")  or "unknown"
+        folder  = metrics_path.parts[-3]  # run folder name
 
-        # Keep only the most recent run per dataset/model/method
-        # (folder names are timestamped — sorted() gives chronological order,
-        #  last one wins)
+        ts_new = _resolve_timestamp(m, folder)
+
         existing = results[dataset][model].get(method)
         if existing is None:
             results[dataset][model][method] = m
+            results[dataset][model][method]["_resolved_ts"] = ts_new
         else:
-            # Compare timestamps
-            if m.get("timestamp_utc", "") > existing.get("timestamp_utc", ""):
+            ts_old = existing.get("_resolved_ts", "")
+            if ts_new > ts_old:
                 results[dataset][model][method] = m
+                results[dataset][model][method]["_resolved_ts"] = ts_new
 
     return results
-
 
 def print_table(results: dict) -> None:
     """Prints a human-readable summary table."""

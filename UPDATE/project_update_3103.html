@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project Update — Anomaly Segmentation</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0f1117;
+    --surface:  #181c25;
+    --border:   #252b38;
+    --accent:   #4a9eff;
+    --accent2:  #7c6af7;
+    --text:     #e2e8f0;
+    --muted:    #64748b;
+    --green:    #34d399;
+    --amber:    #fbbf24;
+    --red:      #f87171;
+    --mono:     'IBM Plex Mono', monospace;
+    --sans:     'IBM Plex Sans', sans-serif;
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.7;
+    padding: 2rem 1rem;
+  }
+
+  .wrapper {
+    max-width: 780px;
+    margin: 0 auto;
+  }
+
+  /* Header */
+  .header {
+    border-left: 3px solid var(--accent);
+    padding: 0.5rem 0 0.5rem 1.25rem;
+    margin-bottom: 2.5rem;
+  }
+  .header .label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 0.4rem;
+  }
+  .header h1 {
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 0.3rem;
+  }
+  .header .meta {
+    font-size: 12px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+
+  /* Sections */
+  section {
+    margin-bottom: 2rem;
+  }
+
+  .section-title {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .section-title::before {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    background: var(--accent);
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  /* Cards */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .card-title {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent);
+    margin-bottom: 0.4rem;
+    font-weight: 500;
+  }
+
+  .card p {
+    font-size: 13px;
+    color: #94a3b8;
+    line-height: 1.6;
+  }
+
+  /* Fix items */
+  .fix {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--amber);
+    border-radius: 0 6px 6px 0;
+    padding: 0.85rem 1.1rem;
+    margin-bottom: 0.6rem;
+  }
+  .fix.green { border-left-color: var(--green); }
+  .fix.red   { border-left-color: var(--red); }
+  .fix.blue  { border-left-color: var(--accent); }
+  .fix.purple{ border-left-color: var(--accent2); }
+
+  .fix-title {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text);
+    margin-bottom: 0.3rem;
+  }
+  .fix p {
+    font-size: 12.5px;
+    color: #94a3b8;
+    line-height: 1.6;
+  }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    background: #1e2330;
+    color: #7dd3fc;
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+  }
+
+  /* Metric pills */
+  .metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+  }
+  .metric {
+    background: #1a2535;
+    border: 1px solid #2a3a52;
+    border-radius: 4px;
+    padding: 0.4rem 0.75rem;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .metric .val { color: var(--green); font-weight: 500; }
+  .metric .lbl { color: var(--muted); }
+
+  /* Folder tree */
+  .tree {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.9;
+  }
+  .tree .folder { color: var(--accent); }
+  .tree .file   { color: #94a3b8; }
+  .tree .note   { color: var(--muted); font-size: 11px; }
+
+  /* Infra */
+  .infra-row {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.75rem;
+  }
+  .infra-pill {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.5rem 1rem;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+  }
+  .infra-pill span { color: var(--accent); font-weight: 500; }
+
+  /* Utils grid */
+  .utils-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem;
+  }
+  @media (max-width: 540px) { .utils-grid { grid-template-columns: 1fr; } }
+
+  .util-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+  }
+  .util-item code { display: block; margin-bottom: 0.3rem; }
+  .util-item p { font-size: 12px; color: #94a3b8; }
+
+  /* Footer */
+  .footer {
+    margin-top: 2.5rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+</style>
+</head>
+<body>
+<div class="wrapper">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="label">Project Update</div>
+    <h1>Anomaly Segmentation Pipeline</h1>
+    <div class="meta">Mask Architecture · ERFNet + EoMT · 5 Benchmarks · March 2026</div>
+  </div>
+
+  <!-- Repo structure -->
+  <section>
+    <div class="section-title">Repository structure</div>
+    <p style="font-size:13px; color:#94a3b8; margin-bottom:0.75rem;">
+      Three folders are forked directly from the professor's repository and left unmodified.
+      All our work lives in <code>src/</code>.
+    </p>
+    <div class="tree">
+      <div><span class="folder">eval/</span>         <span class="note">&#9;&#9;prof — ERFNet training utils + Cityscapes eval scripts</span></div>
+      <div><span class="folder">eomt/</span>         <span class="note">&#9;&#9;prof — EoMT architecture, configs, original weights</span></div>
+      <div><span class="folder">trained_models/</span><span class="note">&#9;prof — pretrained ERFNet weights (Cityscapes)</span></div>
+      <div style="margin-top:0.5rem"><span class="folder">src/</span>          <span class="note">&#9;&#9;ours — full evaluation pipeline</span></div>
+      <div style="padding-left:1.4rem"><span class="folder">models/</span>    <span class="note">&#9;&#9;EoMT wrapper</span></div>
+      <div style="padding-left:1.4rem"><span class="folder">runners/</span>   <span class="note">&#9;&#9;ERFNet + EoMT eval + temperature sweeps</span></div>
+      <div style="padding-left:1.4rem"><span class="folder">utils/</span>     <span class="note">&#9;&#9;dataset, metrics, artifacts, post-processing</span></div>
+      <div style="margin-top:0.5rem"><span class="folder">notebooks/</span>    <span class="note">&#9;Colab pipeline notebook</span></div>
+    </div>
+  </section>
+
+  <!-- Our codebase -->
+  <section>
+    <div class="section-title">Our codebase — src/</div>
+
+    <div class="card">
+      <div class="card-title">src/models/eomt_wrapper.py</div>
+      <p>Robust wrapper around EoMT. The original EoMT code uses bare absolute imports
+      (<code>from models.xxx import ...</code>) that break when called from outside the eomt folder.
+      The wrapper fixes this at runtime via module aliasing in <code>sys.modules</code>, strips
+      common key prefixes (<code>network.</code>, <code>model.</code>, <code>module.</code>)
+      from checkpoint state dicts, and loads only parameters with compatible shapes —
+      making it compatible with checkpoints in different formats without touching original files.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">src/runners/ — ERFNet + EoMT eval runners</div>
+      <p>Full evaluation pipeline rewritten from scratch for both models. Fixes the critical input
+      tensor bug in the professor's original script (see Fixes section). Each runner supports
+      <code>--save-logits</code> to cache raw logits to disk for offline temperature sweep reuse,
+      and produces structured artifacts with timestamped run directories.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">src/runners/ — temperature sweep scripts</div>
+      <p>Offline temperature scaling sweep. Instead of re-running the full model forward pass
+      for each temperature value, these scripts load cached logits from disk and recompute
+      metrics instantly across all temperatures. Run discovery is fully automatic via regex
+      parsing of timestamped artifact folder names — <code>--use-latest</code> finds the most
+      recent valid run with the correct logit cache files on disk.</p>
+    </div>
+
+    <div class="section-title" style="margin-top:1.25rem">src/utils/</div>
+    <div class="utils-grid">
+      <div class="util-item">
+        <code>ood_dataset.py</code>
+        <p>Unified GT mask loading and remapping for all 5 datasets. Fixes LostAndFound double-remap corruption.</p>
+      </div>
+      <div class="util-item">
+        <code>eomt_post.py</code>
+        <p>All EoMT anomaly scoring functions (MSP, MaxEntropy, MaxLogit, RbA) — single source imported by runners and sweeps.</p>
+      </div>
+      <div class="util-item">
+        <code>ood_metrics.py</code>
+        <p>Vectorized FPR@95TPR via cumulative sum sweep. Single implementation used everywhere.</p>
+      </div>
+      <div class="util-item">
+        <code>artifacts.py</code>
+        <p>Structured experiment logging with timestamped run dirs, config saving, and regex-based run discovery.</p>
+      </div>
+      <div class="util-item">
+        <code>determinism.py</code>
+        <p>Full reproducibility: seeds, TF32 disabled, cuDNN deterministic, <code>CUBLAS_WORKSPACE_CONFIG</code>.</p>
+      </div>
+      <div class="util-item">
+        <code>notebooks/</code>
+        <p>Main Colab pipeline — independent cells per dataset, resume from any point after crash.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Weights -->
+  <section>
+    <div class="section-title">Weights</div>
+    <div class="card">
+      <div class="card-title">ERFNet</div>
+      <p>Taken from <code>trained_models/</code> in the professor's repository. Cityscapes pretrained, 20 output classes (19 semantic + unlabelled).</p>
+    </div>
+    <div class="card">
+      <div class="card-title">EoMT</div>
+      <p>Downloaded from the official HuggingFace repository (<code>eomt_cityscapes.bin</code>).
+      Used at <strong>640×640</strong> input resolution — positional embeddings interpolated
+      from the 1024×1024 training resolution automatically at runtime.</p>
+    </div>
+  </section>
+
+  <!-- Fixes -->
+  <section>
+    <div class="section-title">Fixes from the original codebase</div>
+
+    <div class="fix red">
+      <div class="fix-title">Image tensor bug</div>
+      <p>The professor's <code>evalAnomaly.py</code> applied <code>permute(0,3,1,2)</code> after
+      <code>ToTensor()</code>, which already produces <code>[C,H,W]</code>. After
+      <code>unsqueeze(0)</code> the shape is <code>[1,C,H,W]</code> — the permute transformed
+      it into <code>[1,W,C,H]</code>, feeding garbage data to the model. Removed entirely in
+      our runners.</p>
+    </div>
+
+    <div class="fix green">
+      <div class="fix-title">MaxLogit for mask architectures — I fixed my old version implemented from scratch</div>
+      <p>The original sweep used I wrote <code>log(pixel_probs)</code> as a proxy for logits, which is
+      mathematically incorrect: those are log-probabilities of a softmax-normalized distribution,
+      not raw logits. The correct implementation aggregates raw class logits
+      into pixel space weighted by mask probabilities before taking the max, preserving the
+      pre-softmax scale. Formula:
+      <code>pixel_logits[c,h,w] = &sum;_q sigmoid(mask_logits)[q,h,w] &middot; class_logits[q,c]</code>,
+      score = <code>1 - max_c(pixel_logits)</code>.
+      This produced significant improvements across datasets.</p>
+      <div class="metrics">
+        <div class="metric"><span class="val">38% &rarr; 68%</span> <span class="lbl"> AuPRC RA21</span></div>
+        <div class="metric"><span class="val">24% &rarr; 71%</span> <span class="lbl"> AuPRC Road Anomaly</span></div>
+        <div class="metric"><span class="val">0.78% &rarr; 22%</span> <span class="lbl"> AuPRC LAF</span></div>
+        <div class="metric"><span class="val">3.24% &rarr; 58%</span> <span class="lbl"> AuPRC FS Static</span></div>
+      </div>
+    </div>
+
+    <div class="fix amber">
+      <div class="fix-title">LostAndFound remapping guard</div>
+      <p>Some LostAndFound mask exports are already in binary <code>{0,1}</code> format while
+      others use the legacy multi-class encoding. The original code always applied the legacy
+      remapping, corrupting already-binary masks by inverting InD and OOD labels.
+      Added <code>_is_already_binary_ood_mask()</code> detection guard.</p>
+    </div>
+
+    <div class="fix blue">
+      <div class="fix-title">num_classes convention</div>
+      <p>EoMT adds +1 internally for the no-object token, so <code>class_head=(20,768)</code>
+      in the checkpoint matches <code>num_classes=19</code>, not 20. Using 20 caused a shape
+      mismatch that left the classification head randomly initialized — confirmed via diagnostic
+      inspection of checkpoint layer shapes.</p>
+    </div>
+
+    <div class="fix purple">
+      <div class="fix-title">Determinism</div>
+      <p>All results computed in float32 with fixed seeds, TF32 disabled on Ampere GPUs,
+      cuDNN in deterministic mode, and <code>CUBLAS_WORKSPACE_CONFIG=:4096:8</code>.
+      Results are fully reproducible across runs.</p>
+    </div>
+  </section>
+
+  <!-- Peak performance -->
+  <section>
+    <div class="section-title">Peak performance highlights</div>
+    <div class="metrics" style="gap:0.6rem">
+      <div class="metric" style="padding:0.6rem 1rem">
+        <div class="val" style="font-size:16px">91.5%</div>
+        <div class="lbl">AuPRC — EoMT + RbA · RO21</div>
+      </div>
+      <div class="metric" style="padding:0.6rem 1rem">
+        <div class="val" style="font-size:16px">5.4%</div>
+        <div class="lbl">FPR95 — EoMT + RbA · RO21</div>
+      </div>
+      <div class="metric" style="padding:0.6rem 1rem">
+        <div class="val" style="font-size:16px">73.1%</div>
+        <div class="lbl">AuPRC — EoMT + RbA · Road Anomaly</div>
+      </div>
+      <div class="metric" style="padding:0.6rem 1rem">
+        <div class="val" style="font-size:16px">71.5%</div>
+        <div class="lbl">AuPRC — EoMT + MaxLogit · Road Anomaly</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Drive structure -->
+  <section>
+    <div class="section-title">Results on Drive</div>
+    <p style="font-size:13px; color:#94a3b8; margin-bottom:0.75rem;">
+      All artifacts saved under <code>MyDrive/anom_project/</code>.
+    </p>
+    <div class="tree">
+      <div><span class="folder">artifacts/</span>          <span class="note">&#9;metrics json/csv + cached logits per run</span></div>
+      <div><span class="folder">Validation_Dataset/</span> <span class="note">&#9;5 benchmark datasets (professor's GitHub link)</span></div>
+      <div><span class="folder">ckpts/eomt/</span>         <span class="note">&#9;&#9;eomt_cityscapes.bin — HuggingFace</span></div>
+    </div>
+    <div class="card" style="margin-top:0.75rem; border-left: 3px solid var(--amber);">
+      <div class="card-title">Cleanup needed</div>
+      <p>Logit <code>.npy</code> files are large — ERFNet LAF alone is ~4GB. Once results
+      are confirmed, the <code>logits/</code> subfolders can be deleted keeping only
+      <code>results/</code> and <code>sweep/</code> json files.</p>
+    </div>
+  </section>
+
+  <!-- Infrastructure -->
+  <section>
+    <div class="section-title">Infrastructure</div>
+    <div class="infra-row">
+      <div class="infra-pill">GPU <span>A100 80GB</span></div>
+      <div class="infra-pill">Platform <span>Colab Pro+</span></div>
+      <div class="infra-pill">Precision <span>float32 / float16 logits</span></div>
+      <div class="infra-pill">Input res. <span>ERFNet 1024x512 · EoMT 640x640</span></div>
+    </div>
+    <div class="card">
+      <p>The A100 was necessary because the temperature sweep loads all logits for an
+      entire dataset into VRAM at once as a single tensor. ERFNet on LostAndFound (99 images
+      at 1024x512) produces a <code>[99, 20, 512, 1024]</code> float32 tensor of ~4GB.
+      On a T4 (15GB VRAM) this causes OOM after the runner has already consumed most of
+      memory. We deliberately chose not to implement batch-wise sweep processing to keep
+      the codebase simple — the A100's 80GB VRAM handles all datasets without any
+      memory management overhead.</p>
+    </div>
+  </section>
+
+  <div class="footer">
+    Let me know if you have questions or need to align on the extension before contacting the professor.
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Anomaly Segmentation — Research Progress Report</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f7f6f2;
+  --surface: #ffffff;
+  --border: #e2e0d8;
+  --border-dark: #c8c5bb;
+  --text: #1a1917;
+  --muted: #7a776e;
+  --accent: #1a56db;
+  --green: #0d7a55;
+  --red: #c0392b;
+  --amber: #b45309;
+  --purple: #5b3fd4;
+  --mono: 'DM Mono', monospace;
+  --sans: 'DM Sans', sans-serif;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 2rem 1rem 4rem;
+}
+
+.page { max-width: 960px; margin: 0 auto; }
+
+/* Header */
+.header {
+  border-bottom: 2px solid var(--text);
+  padding-bottom: 1.5rem;
+  margin-bottom: 2.5rem;
+}
+.header-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+.header h1 {
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: -0.5px;
+}
+.header .subtitle {
+  font-size: 13px;
+  color: var(--muted);
+  margin-top: 0.25rem;
+}
+.header-meta {
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.8;
+}
+
+/* Section */
+.section {
+  margin-bottom: 2.5rem;
+}
+.section-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.section-label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* Cards grid */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+.card-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 500;
+  margin-bottom: 0.4rem;
+}
+.card p {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+/* Result tables */
+.dataset-block {
+  margin-bottom: 2rem;
+}
+.dataset-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.dataset-name {
+  font-size: 15px;
+  font-weight: 500;
+}
+.dataset-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+.tag {
+  display: inline-block;
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+}
+.tag-base { background: #e1f5ee; color: #085041; }
+.tag-large { background: #eeedfe; color: #26215c; }
+.tag-erfnet { background: #faeeda; color: #633806; }
+.tag-pending { background: #f1efe8; color: #5f5e5a; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 0.5rem;
+}
+thead tr { background: #f1efe8; }
+th {
+  padding: 7px 10px;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+}
+th.r { text-align: right; }
+td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+td.r { text-align: right; font-family: var(--mono); font-size: 11px; }
+td.method { font-family: var(--mono); font-size: 11px; }
+tr:last-child td { border-bottom: none; }
+tr.group-sep td { border-top: 1px solid var(--border-dark); }
+
+.val-good { color: var(--green); font-weight: 500; }
+.val-ok   { color: var(--text); }
+.val-bad  { color: var(--red); }
+.val-na   { color: var(--muted); }
+
+/* Observations */
+.obs {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  padding: 0.75rem 1rem;
+  margin-top: 0.5rem;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.obs.warn { border-left-color: var(--amber); }
+.obs.good { border-left-color: var(--green); }
+.obs strong { color: var(--text); font-weight: 500; }
+
+/* Status bar */
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.75rem;
+}
+.status-item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+}
+.status-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.status-value {
+  font-size: 20px;
+  font-weight: 500;
+  color: var(--text);
+}
+.status-sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 0.1rem;
+}
+
+/* Open questions */
+.questions { list-style: none; }
+.questions li {
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+.questions li:last-child { border-bottom: none; }
+.q-num {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  min-width: 20px;
+  margin-top: 2px;
+}
+
+footer {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- Header -->
+<div class="header">
+  <div class="header-top">
+    <div>
+      <h1>Anomaly Segmentation — Progress Report</h1>
+      <div class="subtitle">Mask Architecture · ERFNet + EoMT Base 640 + EoMT Large 1024 · 5 Benchmarks</div>
+    </div>
+    <div class="header-meta">
+      <div>Date: April 2, 2026</div>
+      <div>Course: Fundamentals of AI</div>
+      <div>PoliTo</div>
+    </div>
+  </div>
+</div>
+
+<!-- Status -->
+<div class="section">
+  <div class="section-label">Current status</div>
+  <div class="status-grid">
+    <div class="status-item">
+      <div class="status-label">Baselines</div>
+      <div class="status-value">✓</div>
+      <div class="status-sub">ERFNet + EoMT Base 640</div>
+    </div>
+    <div class="status-item">
+      <div class="status-label">Ablation</div>
+      <div class="status-value">✓</div>
+      <div class="status-sub">EoMT Large 1024 all datasets</div>
+    </div>
+    <div class="status-item">
+      <div class="status-label">Temp. scaling</div>
+      <div class="status-value">✓</div>
+      <div class="status-sub">All models and datasets</div>
+    </div>
+    <div class="status-item">
+      <div class="status-label">Sliding window</div>
+      <div class="status-value">TBD</div>
+      <div class="status-sub">Pending professor reply</div>
+    </div>
+    <div class="status-item">
+      <div class="status-label">Extension</div>
+      <div class="status-value">TBD</div>
+      <div class="status-sub">Pending professor alignment</div>
+    </div>
+    <div class="status-item">
+      <div class="status-label">Report</div>
+      <div class="status-value">WIP</div>
+      <div class="status-sub">LaTeX 3-page workshop</div>
+    </div>
+  </div>
+</div>
+
+<!-- Setup -->
+<div class="section">
+  <div class="section-label">Experimental setup</div>
+  <div class="cards">
+    <div class="card">
+      <div class="card-title">ERFNet <span class="tag tag-erfnet">pixel-based</span></div>
+      <p>Pretrained on Cityscapes (19+1 classes). Input 1024×512. Methods: MSP, MaxEntropy, MaxLogit. Weights from professor's repo.</p>
+    </div>
+    <div class="card">
+      <div class="card-title">EoMT Base <span class="tag tag-base">640×640</span></div>
+      <p>ViT-Base/14 DINOv2 backbone. Checkpoint: <code>eomt_cityscapes.bin</code> from HuggingFace <code>tue-mps/cityscapes_semantic_eomt_base_640</code>. Methods: MSP, MaxEntropy, MaxLogit, RbA.</p>
+    </div>
+    <div class="card">
+      <div class="card-title">EoMT Large <span class="tag tag-large">1024×1024</span></div>
+      <p>ViT-Large/14 DINOv2 backbone. Checkpoint: <code>eomt_large_1024.bin</code> from HuggingFace <code>tue-mps/cityscapes_semantic_eomt_large_1024</code>. Simple resize inference (no sliding window).</p>
+    </div>
+    <div class="card">
+      <div class="card-title">Infrastructure</div>
+      <p>A100 80GB GPU (Colab Pro+). Temperature sweep offline from cached logits. All results float32, seed=0, deterministic mode.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Results 640 -->
+<div class="section">
+  <div class="section-label">Baseline results — 640×640</div>
+
+  <!-- RA21 -->
+  <div class="dataset-block">
+    <div class="dataset-header">
+      <span class="dataset-name">RoadAnomaly21</span>
+      <span class="dataset-meta">10 images · large anomalous objects</span>
+    </div>
+    <table>
+      <thead><tr>
+        <th>Model</th><th>Method</th>
+        <th class="r">AuPRC ↑</th><th class="r">FPR95 ↓</th>
+      </tr></thead>
+      <tbody>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MSP</td><td class="r val-bad">29.10</td><td class="r val-bad">62.55</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxEntropy</td><td class="r val-bad">30.97</td><td class="r val-bad">62.66</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxLogit</td><td class="r val-ok">38.32</td><td class="r val-bad">59.34</td></tr>
+        <tr class="group-sep"><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MSP</td><td class="r val-ok">37.52</td><td class="r val-bad">67.56</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxEntropy</td><td class="r val-bad">24.56</td><td class="r val-bad">66.95</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxLogit</td><td class="r val-good">68.22</td><td class="r val-ok">26.63</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">RbA</td><td class="r val-ok">58.95</td><td class="r val-bad">57.86</td></tr>
+      </tbody>
+    </table>
+    <div class="obs good"><strong>Best:</strong> EoMT Base MaxLogit 68.22% AuPRC / 26.63% FPR95. MaxLogit clearly dominates on large anomalies.</div>
+  </div>
+
+  <!-- RO21 -->
+  <div class="dataset-block">
+    <div class="dataset-header">
+      <span class="dataset-name">RoadObstacle21</span>
+      <span class="dataset-meta">30 images · small road obstacles · road-area evaluation only</span>
+    </div>
+    <table>
+      <thead><tr><th>Model</th><th>Method</th><th class="r">AuPRC ↑</th><th class="r">FPR95 ↓</th></tr></thead>
+      <tbody>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MSP</td><td class="r val-bad">2.71</td><td class="r val-bad">65.22</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxEntropy</td><td class="r val-bad">3.04</td><td class="r val-bad">65.91</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxLogit</td><td class="r val-bad">4.63</td><td class="r val-ok">48.44</td></tr>
+        <tr class="group-sep"><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MSP</td><td class="r val-ok">56.56</td><td class="r val-bad">99.55</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxEntropy</td><td class="r val-ok">50.35</td><td class="r val-bad">99.70</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxLogit</td><td class="r val-ok">35.05</td><td class="r val-bad">100.00</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">RbA</td><td class="r val-good">91.52</td><td class="r val-good">5.40</td></tr>
+      </tbody>
+    </table>
+    <div class="obs good"><strong>Best:</strong> EoMT Base RbA 91.52% AuPRC / 5.40% FPR95 — outstanding result. RbA's mask-level scoring is uniquely suited for small obstacle detection.</div>
+  </div>
+
+  <!-- LAF -->
+  <div class="dataset-block">
+    <div class="dataset-header">
+      <span class="dataset-name">LostAndFound</span>
+      <span class="dataset-meta">99 images · small obstacles on road · diverse object types</span>
+    </div>
+    <table>
+      <thead><tr><th>Model</th><th>Method</th><th class="r">AuPRC ↑</th><th class="r">FPR95 ↓</th></tr></thead>
+      <tbody>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MSP</td><td class="r val-bad">1.75</td><td class="r val-ok">50.60</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxEntropy</td><td class="r val-bad">2.58</td><td class="r val-ok">50.16</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxLogit</td><td class="r val-bad">3.30</td><td class="r val-ok">45.49</td></tr>
+        <tr class="group-sep"><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MSP</td><td class="r val-bad">0.74</td><td class="r val-ok">57.28</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxEntropy</td><td class="r val-bad">0.72</td><td class="r val-ok">56.69</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxLogit</td><td class="r val-ok">22.41</td><td class="r val-ok">43.81</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">RbA</td><td class="r val-ok">19.51</td><td class="r val-bad">69.20</td></tr>
+      </tbody>
+    </table>
+    <div class="obs warn"><strong>Note:</strong> All methods struggle on LAF. Very small obstacles make detection hard. EoMT MaxLogit (22.41%) best here but FPR95 still high for RbA (69.20%).</div>
+  </div>
+
+  <!-- fs_static -->
+  <div class="dataset-block">
+    <div class="dataset-header">
+      <span class="dataset-name">Fishyscapes Static</span>
+      <span class="dataset-meta">20 images · synthetic paste-in anomalies</span>
+    </div>
+    <table>
+      <thead><tr><th>Model</th><th>Method</th><th class="r">AuPRC ↑</th><th class="r">FPR95 ↓</th></tr></thead>
+      <tbody>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MSP</td><td class="r val-bad">7.47</td><td class="r val-ok">41.84</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxEntropy</td><td class="r val-bad">8.84</td><td class="r val-ok">41.55</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxLogit</td><td class="r val-bad">9.50</td><td class="r val-ok">40.30</td></tr>
+        <tr class="group-sep"><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MSP</td><td class="r val-bad">3.16</td><td class="r val-ok">58.24</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxEntropy</td><td class="r val-bad">2.66</td><td class="r val-ok">57.32</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxLogit</td><td class="r val-good">58.16</td><td class="r val-ok">53.18</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">RbA</td><td class="r val-ok">51.24</td><td class="r val-bad">97.95</td></tr>
+      </tbody>
+    </table>
+    <div class="obs warn"><strong>Note:</strong> RbA FPR95=97.95% — very high false positive rate despite decent AuPRC. EoMT MaxLogit (58.16%) is the strongest method here.</div>
+  </div>
+
+  <!-- RA -->
+  <div class="dataset-block">
+    <div class="dataset-header">
+      <span class="dataset-name">Road Anomaly</span>
+      <span class="dataset-meta">60 images · diverse anomaly types · challenging scenes</span>
+    </div>
+    <table>
+      <thead><tr><th>Model</th><th>Method</th><th class="r">AuPRC ↑</th><th class="r">FPR95 ↓</th></tr></thead>
+      <tbody>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MSP</td><td class="r val-bad">12.42</td><td class="r val-bad">82.58</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxEntropy</td><td class="r val-bad">12.67</td><td class="r val-bad">82.75</td></tr>
+        <tr><td><span class="tag tag-erfnet">ERFNet</span></td><td class="method">MaxLogit</td><td class="r val-bad">15.58</td><td class="r val-bad">73.25</td></tr>
+        <tr class="group-sep"><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MSP</td><td class="r val-bad">22.84</td><td class="r val-bad">74.37</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxEntropy</td><td class="r val-bad">22.86</td><td class="r val-bad">74.50</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">MaxLogit</td><td class="r val-good">71.49</td><td class="r val-ok">29.47</td></tr>
+        <tr><td><span class="tag tag-base">EoMT Base</span></td><td class="method">RbA</td><td class="r val-good">73.08</td><td class="r val-ok">29.96</td></tr>
+      </tbody>
+    </table>
+    <div class="obs good"><strong>Best:</strong> EoMT Base RbA 73.08% / MaxLogit 71.49% — both strong. Mask-based methods dominate pixel-based by ~4.5×.</div>
+  </div>
+</div>
+
+<!-- Results 1024 -->
+<div class="section">
+  <div class="section-label">Ablation — EoMT Large 1024×1024 (simple resize)</div>
+  <div class="obs" style="margin-bottom:1rem"><strong>Setup:</strong> EoMT Large ViT-L/14 DINOv2 checkpoint (<code>eomt_large_1024.bin</code>) with simple resize to 1024×1024. No sliding window. Aspect ratio distortion may affect results on non-square datasets.</div>
+
+  <table>
+    <thead><tr>
+      <th>Dataset</th><th>Method</th>
+      <th class="r">AuPRC Base 640</th>
+      <th class="r">AuPRC Large 1024</th>
+      <th class="r">Δ AuPRC</th>
+      <th class="r">FPR95 Base 640</th>
+      <th class="r">FPR95 Large 1024</th>
+    </tr></thead>
+    <tbody>
+      <!-- RA21 -->
+      <tr><td>RA21</td><td class="method">MSP</td><td class="r">37.52</td><td class="r val-good">87.36</td><td class="r val-good">+49.84</td><td class="r">67.56</td><td class="r">56.08</td></tr>
+      <tr><td>RA21</td><td class="method">MaxEntropy</td><td class="r">24.56</td><td class="r val-bad">14.32</td><td class="r val-bad">−10.24</td><td class="r">66.95</td><td class="r val-bad">100.00</td></tr>
+      <tr><td>RA21</td><td class="method">MaxLogit</td><td class="r">68.22</td><td class="r val-good">82.76</td><td class="r val-good">+14.54</td><td class="r">26.63</td><td class="r val-good">19.78</td></tr>
+      <tr><td>RA21</td><td class="method">RbA</td><td class="r">58.95</td><td class="r val-bad">56.77</td><td class="r val-bad">−2.18</td><td class="r">57.86</td><td class="r val-good">25.48</td></tr>
+      <!-- RO21 -->
+      <tr class="group-sep"><td>RO21</td><td class="method">MSP</td><td class="r">56.56</td><td class="r val-ok">64.67</td><td class="r val-good">+8.11</td><td class="r">99.55</td><td class="r val-bad">99.99</td></tr>
+      <tr><td>RO21</td><td class="method">MaxEntropy</td><td class="r">50.35</td><td class="r val-bad">15.22</td><td class="r val-bad">−35.13</td><td class="r">99.70</td><td class="r val-bad">100.00</td></tr>
+      <tr><td>RO21</td><td class="method">MaxLogit</td><td class="r">35.05</td><td class="r val-ok">43.14</td><td class="r val-good">+8.09</td><td class="r">100.00</td><td class="r">98.49</td></tr>
+      <tr><td>RO21</td><td class="method">RbA</td><td class="r val-good">91.52</td><td class="r val-bad">8.31</td><td class="r val-bad">−83.21</td><td class="r val-good">5.40</td><td class="r val-bad">95.81</td></tr>
+      <!-- LAF -->
+      <tr class="group-sep"><td>LAF</td><td class="method">MSP</td><td class="r">0.74</td><td class="r val-ok">3.33</td><td class="r val-good">+2.59</td><td class="r">57.28</td><td class="r val-bad">97.92</td></tr>
+      <tr><td>LAF</td><td class="method">MaxEntropy</td><td class="r">0.72</td><td class="r val-bad">0.40</td><td class="r val-bad">−0.32</td><td class="r">56.69</td><td class="r val-bad">99.59</td></tr>
+      <tr><td>LAF</td><td class="method">MaxLogit</td><td class="r val-ok">22.41</td><td class="r val-bad">5.13</td><td class="r val-bad">−17.28</td><td class="r">43.81</td><td class="r">47.38</td></tr>
+      <tr><td>LAF</td><td class="method">RbA</td><td class="r val-ok">19.51</td><td class="r val-bad">3.66</td><td class="r val-bad">−15.85</td><td class="r">69.20</td><td class="r val-good">46.32</td></tr>
+      <!-- fs_static -->
+      <tr class="group-sep"><td>fs_static</td><td class="method">MSP</td><td class="r">3.16</td><td class="r val-ok">14.67</td><td class="r val-good">+11.51</td><td class="r">58.24</td><td class="r val-bad">87.37</td></tr>
+      <tr><td>fs_static</td><td class="method">MaxEntropy</td><td class="r">2.66</td><td class="r val-ok">4.24</td><td class="r val-good">+1.58</td><td class="r">57.32</td><td class="r val-bad">99.76</td></tr>
+      <tr><td>fs_static</td><td class="method">MaxLogit</td><td class="r val-good">58.16</td><td class="r val-bad">20.87</td><td class="r val-bad">−37.29</td><td class="r">53.18</td><td class="r val-good">39.34</td></tr>
+      <tr><td>fs_static</td><td class="method">RbA</td><td class="r val-ok">51.24</td><td class="r val-bad">12.76</td><td class="r val-bad">−38.48</td><td class="r val-bad">97.95</td><td class="r val-good">39.69</td></tr>
+      <!-- RA -->
+      <tr class="group-sep"><td>RA</td><td class="method">MSP</td><td class="r">22.84</td><td class="r val-good">57.99</td><td class="r val-good">+35.15</td><td class="r">74.37</td><td class="r">64.74</td></tr>
+      <tr><td>RA</td><td class="method">MaxEntropy</td><td class="r">22.86</td><td class="r val-bad">7.43</td><td class="r val-bad">−15.43</td><td class="r">74.50</td><td class="r val-bad">99.91</td></tr>
+      <tr><td>RA</td><td class="method">MaxLogit</td><td class="r val-good">71.49</td><td class="r val-ok">44.92</td><td class="r val-bad">−26.57</td><td class="r">29.47</td><td class="r">47.95</td></tr>
+      <tr><td>RA</td><td class="method">RbA</td><td class="r val-good">73.08</td><td class="r val-bad">32.36</td><td class="r val-bad">−40.72</td><td class="r">29.96</td><td class="r">48.83</td></tr>
+    </tbody>
+  </table>
+
+  <div class="obs good" style="margin-top:0.75rem"><strong>MSP Large 1024 wins on RA21 and RA</strong> — large anomaly datasets where higher resolution helps discriminate. RA21 MSP: 37.52% → 87.36%.</div>
+  <div class="obs warn" style="margin-top:0.5rem"><strong>MaxEntropy and RbA degrade severely</strong> — FPR95≈100% on most datasets. Hypothesis: simple square resize distorts aspect ratio of non-square images (especially RO21, LAF), corrupting the road-area evaluation mask. Sliding window inference may fix this.</div>
+  <div class="obs" style="margin-top:0.5rem"><strong>MaxLogit Base 640 still better on LAF, fs_static, RA</strong> — the Base model at lower resolution outperforms Large 1024 on these challenging small-obstacle datasets.</div>
+</div>
+
+<!-- Open questions -->
+<div class="section">
+  <div class="section-label">Open questions and next steps</div>
+  <ul class="questions">
+    <li>
+      <span class="q-num">01</span>
+      <span><strong>Sliding window inference</strong> — does using <code>window_imgs_semantic</code> from the professor's repo fix the aspect ratio distortion and recover RbA/MaxEntropy performance on Large 1024? Awaiting professor reply on Discord.</span>
+    </li>
+    <li>
+      <span class="q-num">02</span>
+      <span><strong>GT mask resize bug</strong> — current <code>load_ood_mask</code> does a square resize which distorts the road-area void mask for RO21 and LAF. Need to implement aspect-ratio-preserving resize with padding to correctly handle void pixel boundaries.</span>
+    </li>
+    <li>
+      <span class="q-num">03</span>
+      <span><strong>Script fix</strong> — <code>collect_results.py</code> picks wrong run for ERFNet MSP RA21 (15.21 instead of 29.10) because early runs have <code>timestamp_utc=null</code>. Fix: fall back to folder timestamp when JSON timestamp is null.</span>
+    </li>
+    <li>
+      <span class="q-num">04</span>
+      <span><strong>Extension agreement</strong> — need to contact professor to agree on extension topic before writing the report. Candidates: sliding window ablation, aspect ratio fix analysis, or Base vs Large systematic study.</span>
+    </li>
+    <li>
+      <span class="q-num">05</span>
+      <span><strong>Report (LaTeX)</strong> — 3-page workshop format. Waiting on extension decision and final results before writing.</span>
+    </li>
+  </ul>
+</div>
+
+<footer>
+  Anomaly Segmentation Project · PoliTo Fundamentals of AI · April 2026
+</footer>
+
+</div>
+</body>
+</html>

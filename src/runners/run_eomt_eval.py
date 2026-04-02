@@ -8,7 +8,7 @@ import argparse
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Tuple, List, Dict, Any
+from typing import List, Dict, Any
 
 import numpy as np
 from PIL import Image
@@ -23,6 +23,7 @@ from src.utils.artifacts import create_run_dir
 from src.utils.ood_metrics import fpr_at_95_tpr
 from src.utils.determinism import apply_determinism
 from src.utils.ood_dataset import gt_path_from_image, load_ood_mask
+from src.utils.sliding_window import SlidingWindow
 from src.utils.eomt_post import (
     pixel_probs_from_masks,
     anomaly_from_pixel_probs,
@@ -49,6 +50,39 @@ def append_metrics_csv(csv_path: Path, row: dict) -> None:
         writer.writerow(row)
 
 
+def _anomaly_from_pixel_logits(
+    pixel_logits: torch.Tensor,
+    method: str,
+    temperature: float,
+) -> torch.Tensor:
+    """
+    Computes anomaly score from per-pixel logits [C, H, W].
+    Used in sliding window mode where pixel logits are pre-computed
+    by SlidingWindow.to_pixel_logits() before recomposition.
+
+    RbA is not supported here — it requires the original per-query
+    mask/class decomposition which is lost after crop recomposition.
+    Falls back to MSP when method == 'rba'.
+
+    Returns anomaly map [H, W].
+    """
+    pl = pixel_logits.unsqueeze(0)  # [1, C, H, W]
+
+    if method == "maxlogit":
+        return (1.0 - pl.max(dim=1).values).squeeze(0)
+
+    if method in ("msp", "rba"):
+        probs = (pl / temperature).softmax(dim=1)
+        return (1.0 - probs.max(dim=1).values).squeeze(0)
+
+    if method == "maxentropy":
+        probs = (pl / temperature).softmax(dim=1)
+        entropy = -(probs * (probs + 1e-8).log()).sum(dim=1)
+        return entropy.squeeze(0)
+
+    raise ValueError(f"Unknown method: {method}")
+
+
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
@@ -65,26 +99,43 @@ def main():
                          "so class_head shape = (num_classes+1, 768). "
                          "eomt_cityscapes.bin has class_head=(20,768) → num_classes=19 is correct.")
     ap.add_argument("--resize",      default=None,
-                    help="Override input resolution, e.g. 1024x1024")
+                    help="Override crop resolution e.g. 1024x1024. "
+                         "In sliding window mode this is the crop size.")
     ap.add_argument("--mode",        choices=["robust", "prof-exact"], default="robust")
+
+    # Sliding window options
+    ap.add_argument("--sliding-window", action="store_true",
+                    help="Use sliding window inference — preserves image aspect ratio. "
+                         "Faithful port of professor's window_imgs_semantic pipeline. "
+                         "RbA falls back to MSP in this mode.")
+    ap.add_argument("--sw-batch-size",  type=int, default=1,
+                    help="Crops per forward pass in sliding window mode.")
 
     ap.add_argument("--seed",          type=int,  default=0)
     ap.add_argument("--deterministic", action="store_true")
-
     ap.add_argument("--artifacts-dir", default="artifacts")
-    ap.add_argument("--save-logits",   action="store_true")
+    ap.add_argument("--save-logits",   action="store_true",
+                    help="Cache logits for offline sweep. Not supported in sliding window mode.")
     ap.add_argument("--cpu",           action="store_true")
 
     args = ap.parse_args()
 
-    # Determinism policy
+    # Compatibility warnings
+    if args.sliding_window and args.method == "rba":
+        print("[WARN] RbA is not compatible with sliding window mode "
+              "(requires per-query decomposition). Falling back to MSP on pixel logits.")
+
+    if args.sliding_window and args.save_logits:
+        print("[WARN] --save-logits is ignored in sliding window mode.")
+
+    # Determinism
     want_determinism = (args.mode == "robust") or bool(args.deterministic)
     apply_determinism(mode=args.mode, seed=int(args.seed), deterministic=bool(want_determinism))
 
     device = torch.device("cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu"))
     print("[device]", device)
 
-    # Resolve input resolution
+    # Resolve crop/input resolution
     if args.resize is not None:
         hw = args.resize.lower().replace(" ", "").split("x")
         if len(hw) != 2:
@@ -96,10 +147,11 @@ def main():
 
     size_hw = (H, W)
 
-    input_transform = Compose([
-        Resize(size_hw, Image.BILINEAR),
-        ToTensor(),
-    ])
+    # Standard mode: resize to size_hw. Sliding window: ToTensor only.
+    if not args.sliding_window:
+        input_transform = Compose([Resize(size_hw, Image.BILINEAR), ToTensor()])
+    else:
+        input_transform = ToTensor()
 
     ckpt_basename = os.path.basename(args.ckpt)
     ckpt_sha1_8   = _sha1_8_of_file(args.ckpt)
@@ -112,117 +164,144 @@ def main():
         temperature=args.temperature,
         mode=args.mode,
         extra={
-            "ckpt":             args.ckpt,
-            "ckpt_basename":    ckpt_basename,
-            "ckpt_sha1_8":      ckpt_sha1_8,
-            "config":           args.config,
-            "input_glob":       args.input,
-            "resize_h":         int(H),
-            "resize_w":         int(W),
-            "num_classes":      int(args.num_classes),
-            "seed":             int(args.seed),
-            "deterministic":    bool(want_determinism),
-            "device":           str(device),
-            "cudnn_benchmark":  bool(torch.backends.cudnn.benchmark),
+            "ckpt":                args.ckpt,
+            "ckpt_basename":       ckpt_basename,
+            "ckpt_sha1_8":         ckpt_sha1_8,
+            "config":              args.config,
+            "input_glob":          args.input,
+            "resize_h":            int(H),
+            "resize_w":            int(W),
+            "num_classes":         int(args.num_classes),
+            "sliding_window":      bool(args.sliding_window),
+            "sw_batch_size":       int(args.sw_batch_size),
+            "seed":                int(args.seed),
+            "deterministic":       bool(want_determinism),
+            "device":              str(device),
+            "cudnn_benchmark":     bool(torch.backends.cudnn.benchmark),
             "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
         },
     )
     print("[ARTIFACTS]", art.root)
+    if args.sliding_window:
+        print(f"[sliding window] crop_size={H}x{W} | sw_batch_size={args.sw_batch_size}")
 
     # Build model
-    backbone   = "vit_large_patch14_reg4_dinov2" if "large" in os.path.basename(args.config).lower() \
-                 else "vit_base_patch14_reg4_dinov2"
-    num_q      = 100
-    num_blocks = 3
+    backbone = (
+        "vit_large_patch14_reg4_dinov2"
+        if "large" in os.path.basename(args.config).lower()
+        else "vit_base_patch14_reg4_dinov2"
+    )
 
     model = EoMTWrapper(
         img_size=size_hw,
         num_classes=args.num_classes,
-        num_q=num_q,
-        num_blocks=num_blocks,
+        num_q=100,
+        num_blocks=3,
         backbone_name=backbone,
         masked_attn_enabled=True,
     )
     model.load(args.ckpt, device)
 
-    # Gather image paths
     paths = sorted(glob.glob(os.path.expanduser(args.input)))
-    if len(paths) == 0:
+    if not paths:
         raise FileNotFoundError(f"No images found for glob: {args.input}")
 
     anomaly_list: List[np.ndarray] = []
     ood_list:     List[np.ndarray] = []
     names:        List[str]        = []
-
     mask_logits_cache:  List[np.ndarray] = []
     class_logits_cache: List[np.ndarray] = []
-
     logits_h = logits_w = None
     unique_before_all: set = set()
     unique_after_all:  set = set()
 
     for p in paths:
-        # Load and remap GT mask
+        img_pil = Image.open(p).convert("RGB")
+        orig_hw = (img_pil.height, img_pil.width)
+
         try:
             path_gt = gt_path_from_image(p)
-            raw = np.array(Resize(size_hw, Image.NEAREST)(Image.open(path_gt)))
+            raw = np.array(Image.open(path_gt))
             unique_before_all.update(int(x) for x in np.unique(raw).tolist())
 
-            ood = load_ood_mask(p, size_hw=size_hw)
+            # GT mask: original resolution in SW mode, resized in standard mode
+            gt_size = orig_hw if args.sliding_window else size_hw
+            ood = load_ood_mask(p, size_hw=gt_size)
             unique_after_all.update(int(x) for x in np.unique(ood).tolist())
         except Exception as e:
             print(f"[SKIP] GT error {p}: {e}")
             continue
 
-        # Skip images with no OOD pixels (would distort metrics)
         if 1 not in np.unique(ood):
             continue
 
-        # Forward pass
-        img = Image.open(p).convert("RGB")
-        x   = input_transform(img).unsqueeze(0).float().to(device)
+        x = input_transform(img_pil).unsqueeze(0).float().to(device)
 
-        mask_logits, class_logits = model.forward_masks_and_classes(x)
+        # ── Standard inference ───────────────────────────────────────────────
+        if not args.sliding_window:
+            mask_logits, class_logits = model.forward_masks_and_classes(x)
 
-        if logits_h is None:
-            logits_h, logits_w = int(mask_logits.shape[-2]), int(mask_logits.shape[-1])
+            if logits_h is None:
+                logits_h, logits_w = int(mask_logits.shape[-2]), int(mask_logits.shape[-1])
 
-        # Compute anomaly score using the selected method
-        if args.method == "rba":
-            anomaly = rba_from_masks(mask_logits, class_logits, args.num_classes, args.temperature)
-        elif args.method == "maxlogit":
-            anomaly = anomaly_maxlogit_from_masks(mask_logits, class_logits, args.num_classes)
+            if args.method == "rba":
+                anomaly = rba_from_masks(mask_logits, class_logits, args.num_classes, args.temperature)
+            elif args.method == "maxlogit":
+                anomaly = anomaly_maxlogit_from_masks(mask_logits, class_logits, args.num_classes)
+            else:
+                pixel_probs = pixel_probs_from_masks(mask_logits, class_logits, args.num_classes, args.temperature)
+                anomaly     = anomaly_from_pixel_probs(pixel_probs, args.method)
+
+            if anomaly.shape[-2:] != size_hw:
+                anomaly = F.interpolate(
+                    anomaly.unsqueeze(1), size=size_hw, mode="bilinear", align_corners=False
+                ).squeeze(1)
+
+            if args.save_logits:
+                mask_logits_cache.append(mask_logits.squeeze(0).detach().cpu().to(torch.float16).numpy())
+                class_logits_cache.append(class_logits.squeeze(0).detach().cpu().to(torch.float16).numpy())
+
+        # ── Sliding window inference ─────────────────────────────────────────
         else:
-            # msp / maxentropy path
-            pixel_probs = pixel_probs_from_masks(mask_logits, class_logits, args.num_classes, args.temperature)
-            anomaly     = anomaly_from_pixel_probs(pixel_probs, args.method)
+            sw = SlidingWindow(img_size=min(H, W), device=device)
+            crops, origins, _ = sw.window_image(x)
+            n_crops = len(crops)
 
-        # Upsample anomaly map back to input resolution if needed
-        if anomaly.shape[-2:] != size_hw:
-            anomaly = F.interpolate(
-                anomaly.unsqueeze(1),
-                size=size_hw,
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
+            if logits_h is None:
+                logits_h, logits_w = H, W
+
+            crop_idx = 0
+            for batch in sw.iter_batches(crops, batch_size=args.sw_batch_size):
+                batch = batch.to(device)
+                ml, cl = model.forward_masks_and_classes(batch)
+                pl = SlidingWindow.to_pixel_logits(ml, cl, args.num_classes)
+                indices = list(range(crop_idx, crop_idx + batch.shape[0]))
+                sw.accumulate(pl, origins, orig_hw, indices)
+                crop_idx += batch.shape[0]
+
+            pixel_logits = sw.finalize(orig_hw)   # [C, H, W]
+
+            anomaly = _anomaly_from_pixel_logits(
+                pixel_logits,
+                method=args.method,
+                temperature=args.temperature,
+            ).unsqueeze(0)  # [1, H, W]
+
+            print(f"  [{os.path.basename(p)}] crops={n_crops} orig={orig_hw} "
+                  f"anomaly={tuple(anomaly.shape[-2:])}")
 
         anomaly_list.append(anomaly.squeeze(0).detach().cpu().float().numpy())
         ood_list.append(ood)
         names.append(os.path.basename(p))
 
-        if args.save_logits:
-            mask_logits_cache.append(mask_logits.squeeze(0).detach().cpu().to(torch.float16).numpy())
-            class_logits_cache.append(class_logits.squeeze(0).detach().cpu().to(torch.float16).numpy())
-
     n_used = len(anomaly_list)
     if n_used == 0:
         raise RuntimeError(
-            "No valid images used (all skipped or no OOD pixels after remapping). "
+            "No valid images used. "
             f"mask_unique_before={sorted(unique_before_all)} "
             f"mask_unique_after={sorted(unique_after_all)}"
         )
 
-    # Compute metrics
     ood_gts        = np.array(ood_list)
     anomaly_scores = np.array(anomaly_list)
 
@@ -245,6 +324,8 @@ def main():
         "seed":                int(args.seed),
         "deterministic":       bool(want_determinism),
         "num_classes":         int(args.num_classes),
+        "sliding_window":      bool(args.sliding_window),
+        "sw_batch_size":       int(args.sw_batch_size),
         "resize_h":            int(H),
         "resize_w":            int(W),
         "gt_h":                int(ood_gts.shape[-2]),
@@ -268,14 +349,14 @@ def main():
     }
 
     print("=====================================")
-    print(f"EoMT | dataset={args.dataset_name} | method={args.method} | T={args.temperature} | mode={args.mode}")
+    print(f"EoMT | dataset={args.dataset_name} | method={args.method} | "
+          f"T={args.temperature} | mode={args.mode} | sw={args.sliding_window}")
     print(f"AUPRC: {metrics['auprc_pct']:.4f}")
     print(f"FPR@95TPR: {metrics['fpr95_pct']:.4f}")
     print(f"Images used: {metrics['images_used']}")
-    print(f"Resize: {H}x{W} | logits: {metrics['logits_h']}x{metrics['logits_w']}")
+    print(f"Crop: {H}x{W} | logits ref: {metrics['logits_h']}x{metrics['logits_w']}")
     print("=====================================")
 
-    # Save results
     json_path = art.results / "metrics.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
@@ -285,15 +366,13 @@ def main():
     append_metrics_csv(csv_path, metrics)
     print(f"[SAVED] {csv_path}")
 
-    # Optionally cache logits for offline temperature sweep
-    if args.save_logits:
+    if args.save_logits and not args.sliding_window:
         ds = args.dataset_name
         np.save(art.logits / f"{ds}__mask_logits_f16.npy",  np.array(mask_logits_cache,  dtype=np.float16))
         np.save(art.logits / f"{ds}__class_logits_f16.npy", np.array(class_logits_cache, dtype=np.float16))
         np.save(art.logits / f"{ds}__gt.npy",               ood_gts.astype(np.uint8))
         with open(art.logits / f"{ds}__names.json", "w", encoding="utf-8") as f:
             json.dump(names, f, indent=2)
-
         print(f"[CACHED] {art.logits / f'{ds}__mask_logits_f16.npy'}")
         print(f"[CACHED] {art.logits / f'{ds}__class_logits_f16.npy'}")
         print(f"[CACHED] {art.logits / f'{ds}__gt.npy'}")

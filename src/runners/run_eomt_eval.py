@@ -126,7 +126,8 @@ def main():
               "(requires per-query decomposition). Falling back to MSP on pixel logits.")
 
     if args.sliding_window and args.save_logits:
-        print("[WARN] --save-logits is ignored in sliding window mode.")
+        print("[INFO] --save-logits in sliding window mode: "
+              "recomposed pixel logits [N,C,H,W] will be cached.")
 
     # Determinism
     want_determinism = (args.mode == "robust") or bool(args.deterministic)
@@ -209,8 +210,9 @@ def main():
     anomaly_list: List[np.ndarray] = []
     ood_list:     List[np.ndarray] = []
     names:        List[str]        = []
-    mask_logits_cache:  List[np.ndarray] = []
-    class_logits_cache: List[np.ndarray] = []
+    mask_logits_cache:   List[np.ndarray] = []
+    class_logits_cache:  List[np.ndarray] = []
+    pixel_logits_cache:  List[np.ndarray] = []  # SW mode only
     logits_h = logits_w = None
     unique_before_all: set = set()
     unique_after_all:  set = set()
@@ -294,6 +296,12 @@ def main():
         ood_list.append(ood)
         names.append(os.path.basename(p))
 
+        # Cache pixel logits in SW mode for offline sweep
+        if args.sliding_window and args.save_logits:
+            pixel_logits_cache.append(
+                pixel_logits.detach().cpu().to(torch.float16).numpy()
+            )
+
     n_used = len(anomaly_list)
     if n_used == 0:
         raise RuntimeError(
@@ -375,6 +383,16 @@ def main():
             json.dump(names, f, indent=2)
         print(f"[CACHED] {art.logits / f'{ds}__mask_logits_f16.npy'}")
         print(f"[CACHED] {art.logits / f'{ds}__class_logits_f16.npy'}")
+        print(f"[CACHED] {art.logits / f'{ds}__gt.npy'}")
+        print(f"[CACHED] {art.logits / f'{ds}__names.json'}")
+
+    if args.save_logits and args.sliding_window:
+        ds = args.dataset_name
+        np.save(art.logits / f"{ds}__pixel_logits_f16.npy", np.array(pixel_logits_cache, dtype=np.float16))
+        np.save(art.logits / f"{ds}__gt.npy",               ood_gts.astype(np.uint8))
+        with open(art.logits / f"{ds}__names.json", "w", encoding="utf-8") as f:
+            json.dump(names, f, indent=2)
+        print(f"[CACHED] {art.logits / f'{ds}__pixel_logits_f16.npy'}")
         print(f"[CACHED] {art.logits / f'{ds}__gt.npy'}")
         print(f"[CACHED] {art.logits / f'{ds}__names.json'}")
 

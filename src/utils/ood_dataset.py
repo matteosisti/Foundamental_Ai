@@ -85,10 +85,7 @@ def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
             ood = np.where(ood == 1, 0,   ood)           # road  -> InD
             ood = np.where((ood > 1) & (ood < 201), 1, ood)  # obstacles -> OOD
 
-    if "Streethazard" in path_gt:
-        ood = np.where(ood == 14, 255, ood)   # anomaly class -> tmp void
-        ood = np.where(ood  < 20, 0,   ood)   # known classes -> InD
-        ood = np.where(ood == 255, 1,  ood)   # tmp void      -> OOD
+    
 
     return ood
 

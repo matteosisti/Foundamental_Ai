@@ -20,8 +20,8 @@ Only the **final decoder layer** outputs are used for inference (`mask_list[-1]`
 ### Checkpoint loading — `num_classes` convention
 
 EoMT adds `+1` to `num_classes` internally when building `class_head`:
-- `num_classes=19` → `class_head=(20, 768)` ✅ matches `eomt_cityscapes.bin`
-- `num_classes=20` → `class_head=(21, 768)` ❌ shape mismatch, weights not loaded
+- `num_classes=19` → `class_head=(20, 768)`  matches `eomt_cityscapes.bin`
+- `num_classes=20` → `class_head=(21, 768)`  shape mismatch, weights not loaded
 
 The single `missing=1` at load time is `encoder.backbone.pos_embed` — shape `(1, 4096, 768)` in the checkpoint (1024×1024 training resolution) vs `(1, 1600, 768)` at inference (640×640). EoMT handles this automatically via **positional embedding interpolation** at runtime.
 

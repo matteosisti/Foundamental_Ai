@@ -139,8 +139,3 @@ This ensures reproducibility and easy extension to newer models like EoMT.
 
 ---
 
-### Next Steps
-- Implement EoMT evaluation
-- Add RbA scoring
-- Evaluate all required datasets
-- Produce final comparative results table

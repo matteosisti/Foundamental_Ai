@@ -1,2 +1,0 @@
-model,dataset,method,temperature,mode,auprc,fpr95,auprc_pct,fpr95_pct,images_used,input_glob,weights,device
-ERFNet,RA21,msp,1.0,robust,0.14800932749512583,0.9498528597536691,14.800932749512583,94.9852859753669,10,/content/drive/MyDrive/anom_project/Validation_Dataset/RoadAnomaly21/images/*.*,trained_models/erfnet_pretrained.pth,cuda

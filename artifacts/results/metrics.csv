@@ -1,4 +1,0 @@
-model,dataset,method,temperature,auprc,fpr95,auprc_pct,fpr95_pct,images_used,input_glob,weights
-ERFNet,RA21,msp,1.0,0.1485187888373026,0.9334429008397443,14.85187888373026,93.34429008397443,10,/content/drive/MyDrive/anom_project/Validation_Dataset/RoadAnomaly21/images/*.*,trained_models/erfnet_pretrained.pth
-ERFNet,RA21,maxlogit,1.0,0.14754271103574296,0.9387668332176268,14.754271103574295,93.87668332176268,10,/content/drive/MyDrive/anom_project/Validation_Dataset/RoadAnomaly21/images/*.*,trained_models/erfnet_pretrained.pth
-ERFNet,RA21,maxentropy,1.0,0.14871650043475582,0.9461696406065209,14.871650043475581,94.61696406065208,10,/content/drive/MyDrive/anom_project/Validation_Dataset/RoadAnomaly21/images/*.*,trained_models/erfnet_pretrained.pth

@@ -187,10 +187,10 @@ Defines all shared utilities used across evaluations:
 - `cfg` — loaded and patched cityscapes YAML config pointing to val Zarr
 
 **Cell 3 — EoMT Cityscapes mIoU evaluation**
-Loads `eomt_cityscapes.bin`, instantiates reader from val Zarr, iterates over 500 images, accumulates confusion matrix, prints mIoU every 50 images. Saves per-class IoU and final mIoU to `results/miou_eomt_cityscapes.json`. Runtime: ~1 hour on A100.
+Loads `eomt_cityscapes.bin`, instantiates reader from val Zarr, iterates over 500 images, accumulates confusion matrix, prints mIoU every 50 images. Saves per-class IoU and final mIoU to `results/miou_eomt_cityscapes.json`. Runtime: ~2 minutes 
 
 **Cell 4 — EoMT COCO mIoU evaluation**
-Same pipeline as Cell 3 but loads `eomt_coco.bin` with `num_classes=133`, applies `remap_coco_to_cs` to predictions before updating the IoU meter. Saves results to `results/miou_eomt_coco.json` including `mapped_classes`, `unmapped_classes`, and an explanatory note. Runtime: ~1 hour on A100.
+Same pipeline as Cell 3 but loads `eomt_coco.bin` with `num_classes=133`, applies `remap_coco_to_cs` to predictions before updating the IoU meter. Saves results to `results/miou_eomt_coco.json` including `mapped_classes`, `unmapped_classes`, and an explanatory note. Runtime: ~3 minutes
 
 **Cell 5 — Per-class comparison table**
 Prints a formatted table comparing EoMT Cityscapes and EoMT COCO IoU per class, with delta column. No file output — intended for inline inspection and report copying.

@@ -169,7 +169,7 @@ COCO_TO_CS = {
 
 ## Notebook — `notebooks/step4_miou_eval.ipynb`
 
-The Step 4 evaluation is fully contained in a single Colab notebook at `notebooks/step4_miou_eval.ipynb`. The notebook is structured into 7 sequential cells and is designed to be run top-to-bottom in a single Colab session on an A100 GPU. Total runtime is approximately 2 hours (1 hour per checkpoint evaluation).
+The Step 4 evaluation is fully contained in a single Colab notebook at `notebooks/step4_miou_eval.ipynb`. The notebook is structured into 7 sequential cells and is designed to be run top-to-bottom in a single Colab session on an A100 GPU. Total runtime is approximately 1 hour (45 minutes for Zarr conversion, the rest for running and debugging).
 
 **Cell 0 — Setup and authentication**
 Mounts Google Drive, clones the private project repository using `GITHUB_USERNAME`, `GITHUB_TOKEN`, and `GITHUB_REPO` Colab secrets, clones `segdatakit` from `https://github.com/matteosisti/segdatakit`, and adds both to `sys.path`. No `pip install -e` is used due to the `setuptools.backends` compatibility issue described above.

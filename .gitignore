@@ -24,3 +24,5 @@ Thumbs.db
 *.zip 
 
 notebooks\EDA\eda_from_results.ipynb
+src\run.py
+src\run_lora.py

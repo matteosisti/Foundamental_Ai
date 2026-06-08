@@ -109,7 +109,7 @@ def rba_from_masks(
     class_logits: torch.Tensor,  # [B, Q, C(+1)]
     num_classes: int,
     temperature: float,
-    area_pow: float = 0.5,       # non usato — mantenuto per compatibilità firma
+    area_pow: float = 0.5,      # unused — kept for signature compatibility
 ) -> torch.Tensor:
     """
     RbA — Rejected by All (Nayal et al., ICCV 2023, arXiv 2211.14293).

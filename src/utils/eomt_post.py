@@ -118,9 +118,9 @@ def rba_from_masks(
     """
     RbA — Rejected by All (Nayal et al., ICCV 2023, arXiv 2211.14293).
 
-    Formula esatta dal paper:
+    Formula from paper:
         L_k(x) = sum_q [ softmax(class_logits/T)[q,k] * sigmoid(mask_logits)[q,x] ]
-        RbA(x) = -sum_k tanh(L_k(x))
+        RbA(x) = -sum_k sigmoid(L_k(x))
 
     Higher output = more anomalous.
 
@@ -133,4 +133,4 @@ def rba_from_masks(
     mask_prob    = torch.sigmoid(mask_logits)                      # [B, Q, H, W]
     pixel_logits = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)  # [B, C, H, W]
 
-    return -torch.tanh(pixel_logits).sum(dim=1)                    # [B, H, W]
+    return -torch.sigmoid(pixel_logits).sum(dim=1)                 # [B, H, W]

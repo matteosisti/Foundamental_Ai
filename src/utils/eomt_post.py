@@ -109,29 +109,24 @@ def rba_from_masks(
     class_logits: torch.Tensor,  # [B, Q, C(+1)]
     num_classes: int,
     temperature: float,
-    area_pow: float = 0.5,
+    area_pow: float = 0.5,       # non usato — mantenuto per compatibilità firma
 ) -> torch.Tensor:
     """
-    RbA — Rejected by All (mask-architecture anomaly score).
+    RbA — Rejected by All (Nayal et al., ICCV 2023, arXiv 2211.14293).
 
-    Intuition: a pixel is anomalous if no reliable mask query covers it.
-    Reliability of a query = its max-class confidence * mask_area^area_pow.
-    Normality at a pixel   = max_q( reliability[q] * mask_prob[q, h, w] ).
-    Anomaly                = 1 - normality.
+    Formula esatta dal paper:
+        L_k(x) = sum_q [ softmax(class_logits/T)[q,k] * sigmoid(mask_logits)[q,x] ]
+        RbA(x) = -sum_k tanh(L_k(x))
+
+    Higher output = more anomalous.
 
     Returns: [B, H, W]
     """
     if class_logits.shape[-1] == num_classes + 1:
         class_logits = class_logits[..., :num_classes]
 
-    class_prob  = F.softmax(class_logits / temperature, dim=-1)  # [B, Q, C]
-    conf        = class_prob.max(dim=-1).values                   # [B, Q]
+    class_prob   = F.softmax(class_logits / temperature, dim=-1)  # [B, Q, C]
+    mask_prob    = torch.sigmoid(mask_logits)                      # [B, Q, H, W]
+    pixel_logits = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)  # [B, C, H, W]
 
-    mask_prob   = torch.sigmoid(mask_logits)                      # [B, Q, H, W]
-    area        = mask_prob.mean(dim=(-2, -1))                    # [B, Q]
-
-    reliability = conf * (area.clamp_min(1e-6) ** area_pow)       # [B, Q]
-    reliability = reliability.unsqueeze(-1).unsqueeze(-1)         # [B, Q, 1, 1]
-
-    normality   = (reliability * mask_prob).amax(dim=1)           # [B, H, W]
-    return 1.0 - normality
+    return -torch.tanh(pixel_logits).sum(dim=1)                    # [B, H, W]

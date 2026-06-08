@@ -120,7 +120,16 @@ def rba_from_masks(
 
     Formula from paper:
         L_k(x) = sum_q [ softmax(class_logits/T)[q,k] * sigmoid(mask_logits)[q,x] ]
-        RbA(x) = -sum_k sigmoid(L_k(x))
+        RbA(x) = -sum_k tanh(L_k(x))
+
+    The activation function is tanh, as used in the official implementation:
+        # from evaluate_ood.py (NazirNayal8/RbA, official repo)
+        # logits = out[0]['sem_seg']  # [C, H, W] — pixel-level logits
+        # return -logits.tanh().sum(dim=0)
+
+    In our mask-based setting (EoMT), pixel logits are not directly available
+    from the model output. We reconstruct them via mask-weighted class composition
+    before applying tanh, which is mathematically equivalent.
 
     Higher output = more anomalous.
 
@@ -133,4 +142,4 @@ def rba_from_masks(
     mask_prob    = torch.sigmoid(mask_logits)                      # [B, Q, H, W]
     pixel_logits = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)  # [B, C, H, W]
 
-    return -torch.sigmoid(pixel_logits).sum(dim=1)                 # [B, H, W]
+    return -torch.tanh(pixel_logits).sum(dim=1)                    # [B, H, W]

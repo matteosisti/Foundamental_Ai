@@ -22,11 +22,18 @@ def pixel_probs_from_masks(
     temperature: float,
 ) -> torch.Tensor:
     """
-    MaskFormer-style composition:
-    1. Softmax with temperature on class logits (drop 'no-object' if present).
-    2. Sigmoid on mask logits -> occupancy probabilities.
-    3. Pixel-wise prob: sum_q [ class_prob[q,c] * mask_prob[q,h,w] ].
-    4. Renormalize over classes to get a valid per-pixel distribution.
+    MaskFormer-style composition of class and mask logits into per-pixel scores.
+
+    Steps:
+        1. Softmax with temperature on class logits (drop 'no-object' if present).
+        2. Sigmoid on mask logits -> per-query occupancy probabilities.
+        3. Pixel-wise score: sum_q [ class_prob[q,c] * mask_prob[q,h,w] ].
+
+    Note: renormalization over classes is intentionally omitted.
+    Normalizing pixel / sum(pixel) forces max(pixel_probs) -> 1 everywhere,
+    which collapses MSP = 1 - max(P) -> 0 and makes AuPRC degenerate toward
+    the OOD prevalence. The raw (unnormalized) composition preserves the
+    confidence signal needed for anomaly scoring.
 
     Returns: [B, C, H, W]
     """
@@ -36,10 +43,7 @@ def pixel_probs_from_masks(
     class_prob = F.softmax(class_logits / temperature, dim=-1)  # [B, Q, C]
     mask_prob  = torch.sigmoid(mask_logits)                     # [B, Q, H, W]
 
-    pixel = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)  # [B, C, H, W]
-
-    den = pixel.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    return pixel / den
+    return torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)  # [B, C, H, W]
 
 
 def anomaly_from_pixel_probs(

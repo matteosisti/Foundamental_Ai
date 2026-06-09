@@ -56,13 +56,22 @@ def _anomaly_from_pixel_logits(
     temperature: float,
 ) -> torch.Tensor:
     """
-    Computes anomaly score from per-pixel logits [C, H, W].
-    Used in sliding window mode where pixel logits are pre-computed
-    by SlidingWindow.to_pixel_logits() before recomposition.
+    Computes anomaly score from aggregated per-pixel logits [C, H, W].
+    Used in sliding window mode after crop recomposition via SlidingWindow.
 
-    RbA is not supported here — it requires the original per-query
-    mask/class decomposition which is lost after crop recomposition.
-    Falls back to MSP when method == 'rba'.
+    Equivalent to the reference implementation (semantic_inference + compute_anomaly
+    from DanielVip3/faimdl-project and NazirNayal8/RbA):
+
+        msp        : probs = softmax(logits / T); anomaly = 1 - max(probs)
+        maxlogit   : anomaly = -max(logits)        [temperature has no effect]
+        maxentropy : probs = softmax(logits / T); anomaly = -sum(p * log(p))
+        rba        : anomaly = -sum(tanh(logits), dim=0)
+                     faithful port of evaluate_ood.py: -logits.tanh().sum(dim=0)
+
+    Note: RbA here operates on aggregated pixel logits [C, H, W], not on the
+    original per-query mask/class decomposition used in standard (non-SW) mode.
+    This is equivalent to the reference implementation which also receives
+    already-aggregated logits from semantic_inference().
 
     Returns anomaly map [H, W].
     """
@@ -71,7 +80,7 @@ def _anomaly_from_pixel_logits(
     if method == "maxlogit":
         return (1.0 - pl.max(dim=1).values).squeeze(0)
 
-    if method in ("msp", "rba"):
+    if method == "msp":
         probs = (pl / temperature).softmax(dim=1)
         return (1.0 - probs.max(dim=1).values).squeeze(0)
 
@@ -80,8 +89,13 @@ def _anomaly_from_pixel_logits(
         entropy = -(probs * (probs + 1e-8).log()).sum(dim=1)
         return entropy.squeeze(0)
 
-    raise ValueError(f"Unknown method: {method}")
+    if method == "rba":
+        # RbA on aggregated pixel logits.
+        # Reference: -logits.tanh().sum(dim=0)  [evaluate_ood.py, NazirNayal8/RbA]
+        # The temperature parameter has no effect on RbA by definition.
+        return -torch.tanh(pl).sum(dim=1).squeeze(0)
 
+    raise ValueError(f"Unknown method: {method}")
 
 @torch.no_grad()
 def main():

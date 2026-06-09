@@ -8,9 +8,9 @@
 # this script works on pre-recomposed pixel logits — one tensor per image
 # at original resolution. This is the output of the SlidingWindow pipeline.
 #
-# Supported methods: msp, maxentropy, maxlogit
-# Note: RbA is not supported (requires per-query decomposition).
-
+# Supported methods: msp, maxentropy, maxlogit, rba
+# Note: RbA operates on aggregated pixel logits via -sum(tanh(logits), dim=1),
+# equivalent to the reference implementation (NazirNayal8/RbA, evaluate_ood.py).
 import os
 import json
 import csv

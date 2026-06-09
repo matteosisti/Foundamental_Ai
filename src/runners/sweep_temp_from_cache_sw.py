@@ -35,7 +35,6 @@ def append_metrics_csv(csv_path: Path, row: dict) -> None:
             writer.writeheader()
         writer.writerow(row)
 
-
 def anomaly_from_pixel_logits_t(
     pixel_logits: torch.Tensor,
     method: str,
@@ -44,25 +43,32 @@ def anomaly_from_pixel_logits_t(
     """
     Computes anomaly score from pixel logits [N, C, H, W] at temperature T.
 
+    Supported methods:
+        msp        : 1 - max(softmax(logits / T))
+        maxlogit   : 1 - max(logits)  [temperature-invariant]
+        maxentropy : -sum(p * log(p)) where p = softmax(logits / T)
+        rba        : -sum(tanh(logits), dim=1)  [temperature-invariant]
+                     reference: -logits.tanh().sum(dim=0) [NazirNayal8/RbA]
+
     Returns anomaly map [N, H, W].
     """
     if method == "maxlogit":
-        # Temperature-invariant
-        return (1.0 - pixel_logits.max(dim=1).values)
+        return 1.0 - pixel_logits.max(dim=1).values
+
+    if method == "rba":
+        return -torch.tanh(pixel_logits).sum(dim=1)
 
     scaled = pixel_logits / T
 
-    if method in ("msp", "rba"):
+    if method == "msp":
         probs = scaled.softmax(dim=1)
-        return (1.0 - probs.max(dim=1).values)
+        return 1.0 - probs.max(dim=1).values
 
     if method == "maxentropy":
         probs = scaled.softmax(dim=1)
         return -(probs * (probs + 1e-8).log()).sum(dim=1)
 
     raise ValueError(f"Unknown method: {method}")
-
-
 def main():
     ap = argparse.ArgumentParser(
         description="Offline temperature sweep from cached SW pixel logits."
@@ -84,8 +90,7 @@ def main():
 
     args = ap.parse_args()
 
-    if args.method == "rba":
-        return -torch.tanh(pixel_logits).sum(dim=1)
+
 
     apply_determinism(mode=args.mode, seed=args.seed, deterministic=args.deterministic)
 

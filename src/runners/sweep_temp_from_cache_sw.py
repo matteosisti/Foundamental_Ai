@@ -85,8 +85,7 @@ def main():
     args = ap.parse_args()
 
     if args.method == "rba":
-        print("[WARN] RbA is not supported in SW sweep mode. Using MSP instead.")
-        args.method = "msp"
+        return -torch.tanh(pixel_logits).sum(dim=1)
 
     apply_determinism(mode=args.mode, seed=args.seed, deterministic=args.deterministic)
 

@@ -33,7 +33,7 @@ def _alias_eomt_subpackages():
             mod = importlib.import_module(target_name)
             sys.modules[src_name] = mod
         except Exception:
-            # Silently skip if subpackage is missing
+            # Silently skip if subpackage is missingmasked_attn_enabled: bool = True
             pass
 
 
@@ -131,7 +131,7 @@ class EoMTWrapper(nn.Module):
         num_q: int = 100,
         num_blocks: int = 3,
         backbone_name: str = "vit_base_patch14_reg4_dinov2",
-        masked_attn_enabled: bool = True,
+        masked_attn_enabled: bool = False,
     ):
         super().__init__()
 

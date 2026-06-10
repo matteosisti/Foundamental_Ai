@@ -408,28 +408,45 @@ def main():
                 print(f"[SW] origins: {origins}")
 
             crop_idx = 0
-            for batch in sw.iter_batches(crops, batch_size=args.sw_batch_size):
-                batch = batch.to(device)
-                ml, cl = model.forward_masks_and_classes(batch)
+            # PATCH — autocast float16, coerente con il loro semantic_inference
+            # che wrappa tutto in torch.autocast(dtype=torch.float16, ...).
+            # Senza autocast i pixel_logits in float32 hanno max~35 (sigmoid x
+            # softmax x 100 query), comprimendo la varianza degli score MSP.
+            _ac_dtype  = torch.float16 if device.type == "cuda" else torch.bfloat16
+            with torch.autocast(dtype=_ac_dtype, device_type=device.type):
+                for batch in sw.iter_batches(crops, batch_size=args.sw_batch_size):
+                    batch = batch.to(device)
+                    ml, cl = model.forward_masks_and_classes(batch)
 
-                if args.debug and not _first_image_done and crop_idx == 0:
-                    print(f"\n[DBG:SW] crop 0 — batch shape={tuple(batch.shape)}")
-                    _dbg_tensor("mask_logits (crop 0)", ml)
-                    _dbg_tensor("class_logits (crop 0)", cl)
+                    if args.debug and not _first_image_done and crop_idx == 0:
+                        print(f"\n[DBG:SW] crop 0 — batch shape={tuple(batch.shape)}")
+                        _dbg_tensor("mask_logits (crop 0)", ml)
+                        _dbg_tensor("class_logits (crop 0)", cl)
 
-                pl = SlidingWindow.to_pixel_logits(ml, cl, args.num_classes)
+                    pl = SlidingWindow.to_pixel_logits(ml, cl, args.num_classes)
 
-                if args.debug and not _first_image_done and crop_idx == 0:
-                    _dbg_tensor("pixel_logits dopo to_pixel_logits (crop 0)", pl)
+                    if args.debug and not _first_image_done and crop_idx == 0:
+                        _dbg_tensor("pixel_logits dopo to_pixel_logits (crop 0)", pl)
 
-                indices = list(range(crop_idx, crop_idx + batch.shape[0]))
-                sw.accumulate(pl, origins, orig_hw, indices)
-                crop_idx += batch.shape[0]
+                    indices = list(range(crop_idx, crop_idx + batch.shape[0]))
+                    sw.accumulate(pl.float(), origins, orig_hw, indices)
+                    crop_idx += batch.shape[0]
 
             pixel_logits = sw.finalize(orig_hw)  # [C, H, W]
 
             if args.debug and not _first_image_done:
-                _dbg_tensor("pixel_logits finali (dopo finalize)", pixel_logits)
+                _dbg_tensor("pixel_logits finali (dopo finalize, float32)", pixel_logits)
+                # Con autocast float16 ci aspettiamo max << 35 (era ~35 senza autocast,
+                # ~17 con la vecchia media su overlap). Se ancora >10 l'autocast
+                # non ha effetto (es. device cpu o versione torch senza supporto).
+                pl_max = pixel_logits.max().item()
+                pl_mean = pixel_logits.mean().item()
+                if pl_max > 5.0:
+                    print(f"  [DBG:AUTOCAST] pixel_logits max={pl_max:.4f} — "
+                          f"alto, autocast potrebbe non essere attivo o efficace")
+                else:
+                    print(f"  [DBG:AUTOCAST] pixel_logits max={pl_max:.4f} mean={pl_mean:.4f} — "
+                          f"range compresso, autocast float16 attivo ✓")
 
             anomaly = _anomaly_from_pixel_logits(
                 pixel_logits,

@@ -33,7 +33,7 @@ def _alias_eomt_subpackages():
             mod = importlib.import_module(target_name)
             sys.modules[src_name] = mod
         except Exception:
-            # Silently skip if subpackage is missingmasked_attn_enabled: bool = True
+            # Silently skip if subpackage is missing
             pass
 
 
@@ -131,7 +131,7 @@ class EoMTWrapper(nn.Module):
         num_q: int = 100,
         num_blocks: int = 3,
         backbone_name: str = "vit_base_patch14_reg4_dinov2",
-        masked_attn_enabled: bool = False,
+        masked_attn_enabled: bool = True,
     ):
         super().__init__()
 
@@ -159,7 +159,7 @@ class EoMTWrapper(nn.Module):
 
     def load(self, ckpt_path: str, device: torch.device, mode: str = "robust") -> None:
         """
-        Loads model weights. 
+        Loads model weights.
         'mode' can be 'prof-exact' for strict loading or 'robust' for fuzzy matching.
         """
         mode = mode.lower()
@@ -169,6 +169,15 @@ class EoMTWrapper(nn.Module):
         else:
             miss, unexp = _load_weights_robust(self.net, ckpt_path, device)
             print(f"[EoMT][robust] Loaded fuzzy weights from: {ckpt_path} | missing={miss} unexpected={unexp}")
+
+        # PATCH — eval mode sul wrapper
+        # _load_weights_robust / _load_weights_prof_exact chiamano .eval() solo su
+        # self.net (il modulo EoMT interno), ma lasciano il wrapper EoMTWrapper
+        # stesso in training=True. Qualsiasi submodulo con BatchNorm o Dropout
+        # istanziato fuori da self.net rimarrebbe in training mode.
+        # Questa chiamata mette in eval l'intero albero partendo dal wrapper.
+        self.to(device)
+        self.eval()
 
     @torch.no_grad()
     def forward_masks_and_classes(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

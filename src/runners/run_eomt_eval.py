@@ -282,8 +282,20 @@ def main():
     )
     model.load(args.ckpt, device)
 
+    # PATCH — eval mode sul wrapper
+    # EoMTWrapper.load() chiama .eval() solo su self.net (il modello interno),
+    # ma lascia il wrapper stesso (model) in training=True.
+    # BatchNorm e Dropout rimangono attivi → output stocastici e sbagliati.
+    # La chiamata esplicita qui mette in eval l'intero albero di moduli.
+    model.eval()
+
     # --- Verifica che il modello sia effettivamente in eval e su device ---
-    print(f"[MODEL] training={model.training}  (atteso: False)")
+    if model.training:
+        raise RuntimeError(
+            "[FATAL] model.training=True dopo model.eval() — "
+            "controllare EoMTWrapper o submoduli con .train() forzato."
+        )
+    print(f"[MODEL] training={model.training}  (atteso: False) ✓")
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[MODEL] parametri totali={total_params:,}")
 

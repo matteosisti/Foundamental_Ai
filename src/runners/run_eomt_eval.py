@@ -529,13 +529,11 @@ def main():
         else:
             # ── BRANCH B: Lightning window_imgs_semantic (gruppo 5) ──────────
             if args.lightning_sw:
-                # Replica esatta di semantic_inference() del gruppo 5:
-                #   imgs = [img_tensor]  → uint8 o float a seconda di --no-totensor
-                #   crops, origins = model.window_imgs_semantic(imgs)
-                #   mask_logits = F.interpolate(mask_logits_per_layer[-1], model.img_size)
-                #   crop_logits = model.to_per_pixel_logits_semantic(mask_logits, class_logits)
-                #   logits = model.revert_window_logits_semantic(crop_logits, origins, img_sizes)
-                img_tensor = x.squeeze(0)  # [3, H, W]
+                # Replica esatta di semantic_inference() del gruppo 5.
+                # window_imgs_semantic si aspetta un tensore uint8 [0,255]
+                # perché internamente fa Image.fromarray(img.permute(1,2,0).numpy()).
+                # Convertiamo da float [0,1] a uint8 [0,255].
+                img_tensor = (x.squeeze(0).cpu() * 255).to(torch.uint8).to(device)  # [3,H,W] uint8
                 imgs = [img_tensor]
                 img_sizes = [img_tensor.shape[-2:]]
 

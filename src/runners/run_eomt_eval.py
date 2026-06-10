@@ -372,17 +372,17 @@ def main():
             **_lkw,
         )
 
-        # Carica pesi — strip prefissi, strict=False
-        _clean = {}
-        for _k, _v in _ckpt_state.items():
-            _k2 = _k
-            for _pfx in ("network.", "model.", "module."):
-                while _k2.startswith(_pfx):
-                    _k2 = _k2[len(_pfx):]
-            _clean[_k2] = _v
-        _inc = model.network.load_state_dict(_clean, strict=False)
+        # Carica pesi — esattamente come il gruppo 3 (STEP8_Cityscapes_Coco):
+        #   model.load_state_dict(state_dict, strict=False)
+        # sul wrapper Lightning diretto, senza strip di prefissi.
+        # Il checkpoint eomt_cityscapes.bin ha chiavi senza prefisso "network."
+        # quindi vanno caricate direttamente sul wrapper che le mappa a network.*
+        _inc = model.load_state_dict(_ckpt_state, strict=False)
         print(f"[MODEL][lit] missing={len(_inc.missing_keys)} unexpected={len(_inc.unexpected_keys)}")
-        del _ckpt_raw, _ckpt_state, _clean
+        if len(_inc.missing_keys) > 5:
+            print(f"[MODEL][lit] WARN: molte chiavi mancanti — potrebbero esserci prefissi da strippare")
+            print(f"[MODEL][lit] prime missing: {_inc.missing_keys[:5]}")
+        del _ckpt_raw, _ckpt_state
 
         model = model.to(device)
         model.eval()
@@ -546,10 +546,12 @@ def main():
                 # Imposta window_size esplicitamente come fa questo gruppo (cell 20):
                 #   model.window_size = target_size[0]  # → 1024
                 # Senza questa riga window_imgs_semantic userebbe img_size di default.
-                if hasattr(model, 'window_size'):
-                    _orig_ws = model.window_size
-                    model.window_size = _lit_img_size[0]
-                    print(f"[SW:LIT] window_size impostata a {_lit_img_size[0]}")
+                # Fix 2: imposta model.window_size esplicitamente (come fa il gruppo 3)
+                # window_imgs_semantic usa self.img_size[0] come window size
+                # impostando window_size forziamo i crop alla risoluzione corretta
+                model.window_size = _lit_img_size[0]
+                if args.debug and not _first_image_done:
+                    print(f"[SW:LIT] window_size={model.window_size}")
                 # autocast avvolge TUTTO incluso window_imgs_semantic e model.network
                 with torch.autocast(dtype=_ac_dtype, device_type=device.type):
                     crops_lit, origins_lit = model.window_imgs_semantic(imgs)

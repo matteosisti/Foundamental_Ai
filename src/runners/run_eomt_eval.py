@@ -301,83 +301,96 @@ def main():
     #   revert_window_logits_semantic esattamente come il gruppo 5.
 
     if args.lightning_sw:
-        # Carica il modello completo come Lightning module, identico al gruppo 5
-        print("[MODEL] Caricamento via MaskClassificationSemantic (Lightning) ...")
+        # ── BRANCH B: Lightning module (replica gruppo 5 / step8) ────────────
+        # Istanzia MaskClassificationSemantic con l'img_size rilevata dal
+        # checkpoint (1024×1024 per eomt_cityscapes.bin), carica i pesi
+        # correttamente e usa window_imgs_semantic per l'inference.
+        # Differenza chiave vs Branch A (EoMTWrapper a 640×640):
+        #   - pos_embed caricato correttamente (no size mismatch)
+        #   - window_imgs_semantic scala le immagini a 1024×1024 prima dei crop
+        print("[MODEL] Caricamento via MaskClassificationSemantic (Lightning branch) ...")
         import importlib, yaml, sys as _sys
 
-        # Il config YAML usa import assoluti (models.vit, training.xxx) che
-        # funzionano solo se eomt/ è nel sys.path. Lo aggiungiamo qui.
         _eomt_dir = os.path.join(os.getcwd(), "eomt")
         if _eomt_dir not in _sys.path:
             _sys.path.insert(0, _eomt_dir)
-            print(f"[MODEL][lightning] aggiunto a sys.path: {_eomt_dir}")
+            print(f"[MODEL][lit] sys.path += {_eomt_dir}")
 
-        # Installa lightning se non presente (richiesto da mask_classification_semantic)
         try:
-            import lightning as _lt  # noqa
-            print(f"[MODEL][lightning] lightning già installato: {_lt.__version__}")
+            import lightning as _lt
+            print(f"[MODEL][lit] lightning {_lt.__version__}")
         except ImportError:
-            print("[MODEL][lightning] lightning non trovato — installo ...")
             import subprocess as _sp
-            _sp.run(
-                [_sys.executable, "-m", "pip", "install", "-q", "lightning"],
-                check=True
-            )
-            print("[MODEL][lightning] lightning installato ✓")
+            _sp.run([_sys.executable, "-m", "pip", "install", "-q", "lightning"], check=True)
+            print("[MODEL][lit] lightning installato ✓")
 
-        with open(args.config, "r") as _f:
+        # Rileva img_size dal checkpoint ispezionando pos_embed
+        _ckpt_raw = torch.load(args.ckpt, map_location="cpu")
+        _ckpt_state = _ckpt_raw.get("state_dict", _ckpt_raw)
+        _lit_img_size = (1024, 1024)  # default per eomt_cityscapes.bin
+        for _pk, _pv in _ckpt_state.items():
+            if "pos_embed" in _pk and _pv.dim() == 3:
+                _seq = _pv.shape[1]
+                if _seq in (4096, 4101):
+                    _lit_img_size = (1024, 1024)
+                elif _seq in (1600, 1605):
+                    _lit_img_size = (640, 640)
+                print(f"[MODEL][lit] pos_embed seq={_seq} → img_size={_lit_img_size}")
+                break
+
+        with open(args.config) as _f:
             _cfg = yaml.safe_load(_f)
 
-        # Encoder
-        _enc_cfg = _cfg["model"]["init_args"]["network"]["init_args"]["encoder"]
-        _enc_mod, _enc_cls = _enc_cfg["class_path"].rsplit(".", 1)
-        _enc_cls_obj = getattr(importlib.import_module(_enc_mod), _enc_cls)
-        _encoder = _enc_cls_obj(img_size=size_hw, **_enc_cfg.get("init_args", {}))
+        # Encoder a _lit_img_size
+        _ec = _cfg["model"]["init_args"]["network"]["init_args"]["encoder"]
+        _em, _en = _ec["class_path"].rsplit(".", 1)
+        _encoder = getattr(importlib.import_module(_em), _en)(
+            img_size=_lit_img_size, **_ec.get("init_args", {})
+        )
 
         # Network
-        _net_cfg = _cfg["model"]["init_args"]["network"]
-        _net_mod, _net_cls = _net_cfg["class_path"].rsplit(".", 1)
-        _net_cls_obj = getattr(importlib.import_module(_net_mod), _net_cls)
-        _net_kwargs = {k: v for k, v in _net_cfg["init_args"].items()
-                       if k not in ("encoder", "num_classes", "masked_attn_enabled")}
-        _network = _net_cls_obj(
+        _nc = _cfg["model"]["init_args"]["network"]
+        _nm, _nn = _nc["class_path"].rsplit(".", 1)
+        _nkw = {k: v for k, v in _nc["init_args"].items()
+                if k not in ("encoder", "num_classes", "masked_attn_enabled")}
+        _network = getattr(importlib.import_module(_nm), _nn)(
             masked_attn_enabled=False,
             num_classes=args.num_classes,
             encoder=_encoder,
-            **_net_kwargs,
+            **_nkw,
         )
 
         # Lightning module
-        _lit_mod, _lit_cls = _cfg["model"]["class_path"].rsplit(".", 1)
-        _lit_cls_obj = getattr(importlib.import_module(_lit_mod), _lit_cls)
-        _lit_kwargs = {k: v for k, v in _cfg["model"]["init_args"].items()
-                       if k != "network"}
-        # Rimuovi argomenti non supportati da MaskClassificationSemantic
-        for _k in ("stuff_classes", "overlap_thresh", "mask_thresh"):
-            _lit_kwargs.pop(_k, None)
-
-        model = _lit_cls_obj(
+        _lm, _ln = _cfg["model"]["class_path"].rsplit(".", 1)
+        _lkw = {k: v for k, v in _cfg["model"]["init_args"].items() if k != "network"}
+        for _rk in ("stuff_classes", "overlap_thresh", "mask_thresh"):
+            _lkw.pop(_rk, None)
+        model = getattr(importlib.import_module(_lm), _ln)(
             network=_network,
-            img_size=size_hw,
+            img_size=_lit_img_size,
             num_classes=args.num_classes,
-            **_lit_kwargs,
+            **_lkw,
         )
 
-        # Carica i pesi — rimuovi prefissi Lightning/DataParallel e carica su network
-        _raw = torch.load(args.ckpt, map_location="cpu")
-        _state = _raw.get("state_dict", _raw)
+        # Carica pesi — strip prefissi, strict=False
         _clean = {}
-        for _k, _v in _state.items():
+        for _k, _v in _ckpt_state.items():
             _k2 = _k
             for _pfx in ("network.", "model.", "module."):
                 while _k2.startswith(_pfx):
                     _k2 = _k2[len(_pfx):]
             _clean[_k2] = _v
         _inc = model.network.load_state_dict(_clean, strict=False)
-        print(f"[MODEL][lightning] missing={len(_inc.missing_keys)} unexpected={len(_inc.unexpected_keys)}")
+        print(f"[MODEL][lit] missing={len(_inc.missing_keys)} unexpected={len(_inc.unexpected_keys)}")
+        del _ckpt_raw, _ckpt_state, _clean
+
         model = model.to(device)
         model.eval()
+        if model.training:
+            raise RuntimeError("[FATAL] model.training=True dopo eval()")
         print(f"[MODEL] training={model.training}  (atteso: False) ✓")
+        print(f"[MODEL][lit] img_size={_lit_img_size} — window_imgs_semantic scala dinamicamente")
+
     else:
         model = EoMTWrapper(
             img_size=size_hw,

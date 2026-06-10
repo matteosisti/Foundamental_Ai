@@ -312,6 +312,19 @@ def main():
             _sys.path.insert(0, _eomt_dir)
             print(f"[MODEL][lightning] aggiunto a sys.path: {_eomt_dir}")
 
+        # Installa lightning se non presente (richiesto da mask_classification_semantic)
+        try:
+            import lightning as _lt  # noqa
+            print(f"[MODEL][lightning] lightning già installato: {_lt.__version__}")
+        except ImportError:
+            print("[MODEL][lightning] lightning non trovato — installo ...")
+            import subprocess as _sp
+            _sp.run(
+                [_sys.executable, "-m", "pip", "install", "-q", "lightning"],
+                check=True
+            )
+            print("[MODEL][lightning] lightning installato ✓")
+
         with open(args.config, "r") as _f:
             _cfg = yaml.safe_load(_f)
 
@@ -350,14 +363,9 @@ def main():
             **_lit_kwargs,
         )
 
-        # Carica i pesi — stesso percorso del gruppo 5
-        from src.utils.eomt_post import _clean_state_dict_keys  # riusa helper esistente
+        # Carica i pesi — rimuovi prefissi Lightning/DataParallel e carica su network
         _raw = torch.load(args.ckpt, map_location="cpu")
-        if "state_dict" in _raw:
-            _state = _raw["state_dict"]
-        else:
-            _state = _raw
-        # Rimuovi prefissi "network." se presenti
+        _state = _raw.get("state_dict", _raw)
         _clean = {}
         for _k, _v in _state.items():
             _k2 = _k

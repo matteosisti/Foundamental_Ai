@@ -201,6 +201,11 @@ def main():
                          "module invece del SlidingWindow custom. Replica fedelmente il percorso "
                          "del gruppo 5 (project.ipynb, semantic_inference). "
                          "Richiede che il modello sia caricato come MaskClassificationSemantic.")
+    ap.add_argument("--lightning-v2", action="store_true",
+                    help="Replica ESATTA del pipeline di STEP8_Cityscapes_Coco__2_.ipynb: "
+                         "input_transform Resize(512,1024) + uint8 + model.load_state_dict "
+                         "sul wrapper + get_eomt_logits con autocast float16. "
+                         "Completamente indipendente dal branch --lightning-sw.")
 
     args = ap.parse_args()
 
@@ -253,6 +258,7 @@ def main():
     print(f"[SESSION] debug={args.debug}")
     print(f"[SESSION] no_totensor={args.no_totensor}  (uint8 [0,255] → modello)")
     print(f"[SESSION] lightning_sw={args.lightning_sw}  (usa window_imgs_semantic del Lightning module)")
+    print(f"[SESSION] lightning_v2={args.lightning_v2}  (replica esatta STEP8_Cityscapes_Coco)")
     print("=" * 60)
 
     ckpt_basename = os.path.basename(args.ckpt)
@@ -391,6 +397,79 @@ def main():
         print(f"[MODEL] training={model.training}  (atteso: False) ✓")
         print(f"[MODEL][lit] img_size={_lit_img_size} — window_imgs_semantic scala dinamicamente")
 
+    elif args.lightning_v2:
+        # ── BRANCH C: lightning_v2 — replica ESATTA STEP8_Cityscapes_Coco__2_ ──
+        # Carica il modello esattamente come fa il gruppo 3:
+        #   1. img_size=(1024,1024) rilevata dal checkpoint
+        #   2. model.load_state_dict(state_dict, strict=False) sul wrapper Lightning
+        #   3. Input: Resize(512,1024) PIL senza ToTensor → uint8 [0,255]
+        #   4. get_eomt_logits con autocast float16
+        print("[MODEL] Caricamento via MaskClassificationSemantic (lightning_v2 — replica STEP8) ...")
+        import importlib, yaml, sys as _sys
+
+        _eomt_dir = os.path.join(os.getcwd(), "eomt")
+        if _eomt_dir not in _sys.path:
+            _sys.path.insert(0, _eomt_dir)
+
+        try:
+            import lightning as _lt
+            print(f"[MODEL][v2] lightning {_lt.__version__}")
+        except ImportError:
+            import subprocess as _sp
+            _sp.run([_sys.executable, "-m", "pip", "install", "-q", "lightning"], check=True)
+
+        # img_size dal checkpoint (1024x1024 per eomt_cityscapes.bin)
+        _ckpt_raw = torch.load(args.ckpt, map_location="cpu")
+        _ckpt_state = _ckpt_raw.get("state_dict", _ckpt_raw)
+        _v2_img_size = (1024, 1024)
+        for _pk, _pv in _ckpt_state.items():
+            if "pos_embed" in _pk and _pv.dim() == 3:
+                _seq = _pv.shape[1]
+                if _seq in (1600, 1605):
+                    _v2_img_size = (640, 640)
+                print(f"[MODEL][v2] pos_embed seq={_seq} → img_size={_v2_img_size}")
+                break
+
+        with open(args.config) as _f:
+            _cfg = yaml.safe_load(_f)
+
+        _ec = _cfg["model"]["init_args"]["network"]["init_args"]["encoder"]
+        _em, _en = _ec["class_path"].rsplit(".", 1)
+        _encoder = getattr(importlib.import_module(_em), _en)(
+            img_size=_v2_img_size, **_ec.get("init_args", {})
+        )
+        _nc = _cfg["model"]["init_args"]["network"]
+        _nm, _nn = _nc["class_path"].rsplit(".", 1)
+        _nkw = {k: v for k, v in _nc["init_args"].items()
+                if k not in ("encoder", "num_classes", "masked_attn_enabled")}
+        _network = getattr(importlib.import_module(_nm), _nn)(
+            masked_attn_enabled=False,
+            num_classes=args.num_classes,
+            encoder=_encoder,
+            **_nkw,
+        )
+        _lm, _ln = _cfg["model"]["class_path"].rsplit(".", 1)
+        _lkw = {k: v for k, v in _cfg["model"]["init_args"].items() if k != "network"}
+        for _rk in ("stuff_classes", "overlap_thresh", "mask_thresh"):
+            _lkw.pop(_rk, None)
+        model = getattr(importlib.import_module(_lm), _ln)(
+            network=_network,
+            img_size=_v2_img_size,
+            num_classes=args.num_classes,
+            **_lkw,
+        )
+
+        # Carica pesi SUL WRAPPER come fa il gruppo 3
+        _inc = model.load_state_dict(_ckpt_state, strict=False)
+        print(f"[MODEL][v2] missing={len(_inc.missing_keys)} unexpected={len(_inc.unexpected_keys)}")
+        del _ckpt_raw, _ckpt_state
+
+        model = model.to(device)
+        model.eval()
+        if model.training:
+            raise RuntimeError("[FATAL] model.training=True dopo eval()")
+        print(f"[MODEL][v2] ✓  img_size={_v2_img_size}")
+
     else:
         model = EoMTWrapper(
             img_size=size_hw,
@@ -477,7 +556,17 @@ def main():
             continue
 
         # Costruzione tensore input
-        if args.no_totensor:
+        if args.lightning_v2:
+            # BRANCH C: replica ESATTA STEP8 — Resize(512,1024) + uint8 [0,255]
+            # input_transform = Resize((512,1024), BILINEAR) senza ToTensor
+            import numpy as _np2
+            _img_resized_v2 = Image.fromarray(
+                _np2.array(img_pil.resize((1024, 512), Image.BILINEAR))
+            )
+            # torch.from_numpy su PIL uint8 → uint8 tensor [0,255]
+            x_v2 = torch.from_numpy(_np2.array(_img_resized_v2)).permute(2, 0, 1)  # [3,512,1024] uint8
+            x = x_v2.unsqueeze(0).float().to(device)  # usato solo per compatibilità GT size
+        elif args.no_totensor:
             # Replica gruppo 5: PIL → np.array uint8 [0,255] → tensor float [0,255]
             if input_transform is not None:
                 img_resized = input_transform(img_pil)  # solo Resize, no ToTensor
@@ -527,8 +616,83 @@ def main():
 
         # ── Sliding window inference ──────────────────────────────────────────
         else:
+            # ── BRANCH C: lightning_v2 — replica ESATTA STEP8_Cityscapes_Coco ──
+            if args.lightning_v2:
+                # Replica esatta cell 20-21 di STEP8_Cityscapes_Coco__2_.ipynb:
+                #   img_tensor = torch.from_numpy(np.array(img_pil_512x1024)).permute(2,0,1)  uint8
+                #   model.window_size = target_size[0]
+                #   with autocast(float16):
+                #     crops, origins = model.window_imgs_semantic([img_tensor])
+                #     ml, cl = model(crops)
+                #     ml = F.interpolate(ml[-1], target_size, bilinear)
+                #     crop_logits = model.to_per_pixel_logits_semantic(ml, cl[-1])
+                #     logits = model.revert_window_logits_semantic(crop_logits, origins, img_sizes)
+                import numpy as _npv2
+                _img_pil_512 = img_pil.resize((1024, 512), Image.BILINEAR)
+                img_tensor_v2 = torch.from_numpy(
+                    _npv2.array(_img_pil_512)
+                ).permute(2, 0, 1).to(device)  # uint8 [3,512,1024]
+
+                _v2_target = _v2_img_size  # (1024,1024) dal modello
+                model.window_size = _v2_target[0]
+
+                img_sizes_v2 = [img_tensor_v2.shape[-2:]]
+
+                _ac_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+                with torch.autocast(dtype=_ac_dtype, device_type=device.type):
+                    crops_v2, origins_v2 = model.window_imgs_semantic([img_tensor_v2])
+                    n_crops = len(crops_v2)
+
+                    if logits_h is None:
+                        logits_h, logits_w = _v2_target
+                        print(f"[SW:V2] prima immagine: orig_hw={orig_hw} "
+                              f"n_crops={n_crops} origins={origins_v2}")
+
+                    ml_v2, cl_v2 = model.network(crops_v2)
+                    ml_v2_interp = F.interpolate(
+                        ml_v2[-1], _v2_target, mode="bilinear"
+                    )
+                    crop_logits_v2 = model.to_per_pixel_logits_semantic(
+                        ml_v2_interp, cl_v2[-1]
+                    )
+                    logits_v2 = model.revert_window_logits_semantic(
+                        crop_logits_v2, origins_v2, img_sizes_v2
+                    )
+                    # logits_v2[0] shape: [C, H_scaled, W_scaled]
+                    pixel_logits_v2 = logits_v2[0].float()
+
+                if args.debug and not _first_image_done:
+                    _dbg_tensor("pixel_logits_v2 (Lightning v2)", pixel_logits_v2)
+                    print(f"  [DBG:V2] pixel_logits max={pixel_logits_v2.max().item():.4f} "
+                          f"mean={pixel_logits_v2.mean().item():.4f}")
+
+                # Calcola anomaly score dai pixel_logits
+                anomaly = _anomaly_from_pixel_logits(
+                    pixel_logits_v2,
+                    method=args.method,
+                    temperature=args.temperature,
+                ).unsqueeze(0)  # [1, H, W]
+
+                # GT è a orig_hw, anomaly è a img_sizes_v2
+                # Upsample anomaly a orig_hw per confronto
+                anomaly_hw = tuple(anomaly.shape[-2:])
+                gt_hw      = tuple(ood.shape[-2:])
+                if anomaly_hw != gt_hw:
+                    anomaly = F.interpolate(
+                        anomaly.unsqueeze(0), size=gt_hw,
+                        mode="bilinear", align_corners=False,
+                    ).squeeze(0)
+
+                print(f"  [SW:V2] {os.path.basename(p)}: crops={n_crops} "
+                      f"orig={orig_hw} anomaly={tuple(anomaly.shape[-2:])} gt={gt_hw}")
+
+                if args.save_logits:
+                    pixel_logits_cache.append(
+                        pixel_logits_v2.detach().cpu().to(torch.float16).numpy()
+                    )
+
             # ── BRANCH B: Lightning window_imgs_semantic (gruppo 5) ──────────
-            if args.lightning_sw:
+            elif args.lightning_sw:
                 # Replica esatta di semantic_inference() del gruppo 5.
                 # window_imgs_semantic si aspetta un tensore uint8 [0,255]
                 # perché internamente fa Image.fromarray(img.permute(1,2,0).numpy()).

@@ -303,7 +303,15 @@ def main():
     if args.lightning_sw:
         # Carica il modello completo come Lightning module, identico al gruppo 5
         print("[MODEL] Caricamento via MaskClassificationSemantic (Lightning) ...")
-        import importlib, yaml
+        import importlib, yaml, sys as _sys
+
+        # Il config YAML usa import assoluti (models.vit, training.xxx) che
+        # funzionano solo se eomt/ è nel sys.path. Lo aggiungiamo qui.
+        _eomt_dir = os.path.join(os.getcwd(), "eomt")
+        if _eomt_dir not in _sys.path:
+            _sys.path.insert(0, _eomt_dir)
+            print(f"[MODEL][lightning] aggiunto a sys.path: {_eomt_dir}")
+
         with open(args.config, "r") as _f:
             _cfg = yaml.safe_load(_f)
 

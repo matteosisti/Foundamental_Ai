@@ -196,6 +196,11 @@ def main():
     ap.add_argument("--no-totensor", action="store_true",
                     help="NON divide per 255 — passa uint8 [0,255] al modello come fa il gruppo 5. "
                          "Solo per confronto sperimentale.")
+    ap.add_argument("--lightning-sw", action="store_true",
+                    help="Usa window_imgs_semantic / revert_window_logits_semantic del Lightning "
+                         "module invece del SlidingWindow custom. Replica fedelmente il percorso "
+                         "del gruppo 5 (project.ipynb, semantic_inference). "
+                         "Richiede che il modello sia caricato come MaskClassificationSemantic.")
 
     args = ap.parse_args()
 
@@ -247,6 +252,7 @@ def main():
     print(f"[SESSION] device={device} seed={args.seed} deterministic={want_determinism}")
     print(f"[SESSION] debug={args.debug}")
     print(f"[SESSION] no_totensor={args.no_totensor}  (uint8 [0,255] → modello)")
+    print(f"[SESSION] lightning_sw={args.lightning_sw}  (usa window_imgs_semantic del Lightning module)")
     print("=" * 60)
 
     ckpt_basename = os.path.basename(args.ckpt)
@@ -288,15 +294,84 @@ def main():
     )
     print(f"[MODEL] backbone={backbone}")
 
-    model = EoMTWrapper(
-        img_size=size_hw,
-        num_classes=args.num_classes,
-        num_q=100,
-        num_blocks=3,
-        backbone_name=backbone,
-        masked_attn_enabled=True,
-    )
-    model.load(args.ckpt, device)
+    # ── Model loading ────────────────────────────────────────────────────
+    # Branch A (default):  EoMTWrapper custom — forward_masks_and_classes()
+    # Branch B (--lightning-sw): MaskClassificationSemantic Lightning module
+    #   usa window_imgs_semantic + to_per_pixel_logits_semantic +
+    #   revert_window_logits_semantic esattamente come il gruppo 5.
+
+    if args.lightning_sw:
+        # Carica il modello completo come Lightning module, identico al gruppo 5
+        print("[MODEL] Caricamento via MaskClassificationSemantic (Lightning) ...")
+        import importlib, yaml
+        with open(args.config, "r") as _f:
+            _cfg = yaml.safe_load(_f)
+
+        # Encoder
+        _enc_cfg = _cfg["model"]["init_args"]["network"]["init_args"]["encoder"]
+        _enc_mod, _enc_cls = _enc_cfg["class_path"].rsplit(".", 1)
+        _enc_cls_obj = getattr(importlib.import_module(_enc_mod), _enc_cls)
+        _encoder = _enc_cls_obj(img_size=size_hw, **_enc_cfg.get("init_args", {}))
+
+        # Network
+        _net_cfg = _cfg["model"]["init_args"]["network"]
+        _net_mod, _net_cls = _net_cfg["class_path"].rsplit(".", 1)
+        _net_cls_obj = getattr(importlib.import_module(_net_mod), _net_cls)
+        _net_kwargs = {k: v for k, v in _net_cfg["init_args"].items()
+                       if k not in ("encoder", "num_classes", "masked_attn_enabled")}
+        _network = _net_cls_obj(
+            masked_attn_enabled=False,
+            num_classes=args.num_classes,
+            encoder=_encoder,
+            **_net_kwargs,
+        )
+
+        # Lightning module
+        _lit_mod, _lit_cls = _cfg["model"]["class_path"].rsplit(".", 1)
+        _lit_cls_obj = getattr(importlib.import_module(_lit_mod), _lit_cls)
+        _lit_kwargs = {k: v for k, v in _cfg["model"]["init_args"].items()
+                       if k != "network"}
+        # Rimuovi argomenti non supportati da MaskClassificationSemantic
+        for _k in ("stuff_classes", "overlap_thresh", "mask_thresh"):
+            _lit_kwargs.pop(_k, None)
+
+        model = _lit_cls_obj(
+            network=_network,
+            img_size=size_hw,
+            num_classes=args.num_classes,
+            **_lit_kwargs,
+        )
+
+        # Carica i pesi — stesso percorso del gruppo 5
+        from src.utils.eomt_post import _clean_state_dict_keys  # riusa helper esistente
+        _raw = torch.load(args.ckpt, map_location="cpu")
+        if "state_dict" in _raw:
+            _state = _raw["state_dict"]
+        else:
+            _state = _raw
+        # Rimuovi prefissi "network." se presenti
+        _clean = {}
+        for _k, _v in _state.items():
+            _k2 = _k
+            for _pfx in ("network.", "model.", "module."):
+                while _k2.startswith(_pfx):
+                    _k2 = _k2[len(_pfx):]
+            _clean[_k2] = _v
+        _inc = model.network.load_state_dict(_clean, strict=False)
+        print(f"[MODEL][lightning] missing={len(_inc.missing_keys)} unexpected={len(_inc.unexpected_keys)}")
+        model = model.to(device)
+        model.eval()
+        print(f"[MODEL] training={model.training}  (atteso: False) ✓")
+    else:
+        model = EoMTWrapper(
+            img_size=size_hw,
+            num_classes=args.num_classes,
+            num_q=100,
+            num_blocks=3,
+            backbone_name=backbone,
+            masked_attn_enabled=True,
+        )
+        model.load(args.ckpt, device)
 
     # PATCH — eval mode sul wrapper
     # EoMTWrapper.load() chiama .eval() solo su self.net (il modello interno),
@@ -423,83 +498,140 @@ def main():
 
         # ── Sliding window inference ──────────────────────────────────────────
         else:
-            sw = SlidingWindow(img_size=min(H, W), device=device)
-            crops, origins, _ = sw.window_image(x)
-            n_crops = len(crops)
+            # ── BRANCH B: Lightning window_imgs_semantic (gruppo 5) ──────────
+            if args.lightning_sw:
+                # Replica esatta di semantic_inference() del gruppo 5:
+                #   imgs = [img_tensor]  → uint8 o float a seconda di --no-totensor
+                #   crops, origins = model.window_imgs_semantic(imgs)
+                #   mask_logits = F.interpolate(mask_logits_per_layer[-1], model.img_size)
+                #   crop_logits = model.to_per_pixel_logits_semantic(mask_logits, class_logits)
+                #   logits = model.revert_window_logits_semantic(crop_logits, origins, img_sizes)
+                img_tensor = x.squeeze(0)  # [3, H, W]
+                imgs = [img_tensor]
+                img_sizes = [img_tensor.shape[-2:]]
 
-            if logits_h is None:
-                logits_h, logits_w = H, W
-                print(f"[SW] prima immagine: orig_hw={orig_hw} n_crops={n_crops} "
-                      f"crop_size={min(H,W)}x{min(H,W)}")
-                print(f"[SW] origins: {origins}")
+                _ac_dtype  = torch.float16 if device.type == "cuda" else torch.bfloat16
+                with torch.autocast(dtype=_ac_dtype, device_type=device.type):
+                    crops_lit, origins_lit = model.window_imgs_semantic(imgs)
+                    n_crops = len(crops_lit)
 
-            crop_idx = 0
-            # PATCH — autocast float16, coerente con il loro semantic_inference
-            # che wrappa tutto in torch.autocast(dtype=torch.float16, ...).
-            # Senza autocast i pixel_logits in float32 hanno max~35 (sigmoid x
-            # softmax x 100 query), comprimendo la varianza degli score MSP.
-            _ac_dtype  = torch.float16 if device.type == "cuda" else torch.bfloat16
-            with torch.autocast(dtype=_ac_dtype, device_type=device.type):
-                for batch in sw.iter_batches(crops, batch_size=args.sw_batch_size):
-                    batch = batch.to(device)
-                    ml, cl = model.forward_masks_and_classes(batch)
+                    if logits_h is None:
+                        logits_h, logits_w = H, W
+                        print(f"[SW:LIT] prima immagine: orig_hw={orig_hw} "
+                              f"n_crops={n_crops} origins={origins_lit}")
 
-                    if args.debug and not _first_image_done and crop_idx == 0:
-                        print(f"\n[DBG:SW] crop 0 — batch shape={tuple(batch.shape)}")
-                        _dbg_tensor("mask_logits (crop 0)", ml)
-                        _dbg_tensor("class_logits (crop 0)", cl)
+                    mask_logits_layers, class_logits_layers = model.network(crops_lit)
+                    mask_logits_lit = F.interpolate(
+                        mask_logits_layers[-1], model.img_size, mode="bilinear"
+                    )
+                    crop_logits_lit = model.to_per_pixel_logits_semantic(
+                        mask_logits_lit, class_logits_layers[-1]
+                    )
+                    logits_lit = model.revert_window_logits_semantic(
+                        crop_logits_lit, origins_lit, img_sizes
+                    )
+                    pixel_logits = logits_lit[0].float()  # [C, H, W]
 
-                    pl = SlidingWindow.to_pixel_logits(ml, cl, args.num_classes)
+                if args.debug and not _first_image_done:
+                    _dbg_tensor("pixel_logits finali (Lightning SW)", pixel_logits)
+                    pl_max = pixel_logits.max().item()
+                    print(f"  [DBG:LIT] pixel_logits max={pl_max:.4f}")
 
-                    if args.debug and not _first_image_done and crop_idx == 0:
-                        _dbg_tensor("pixel_logits dopo to_pixel_logits (crop 0)", pl)
+                anomaly = _anomaly_from_pixel_logits(
+                    pixel_logits,
+                    method=args.method,
+                    temperature=args.temperature,
+                ).unsqueeze(0)
 
-                    indices = list(range(crop_idx, crop_idx + batch.shape[0]))
-                    sw.accumulate(pl.float(), origins, orig_hw, indices)
-                    crop_idx += batch.shape[0]
+                anomaly_hw = tuple(anomaly.shape[-2:])
+                gt_hw      = tuple(ood.shape[-2:])
+                if anomaly_hw != gt_hw:
+                    print(f"  [WARN:LIT_SHAPE] mismatch anomaly={anomaly_hw} gt={gt_hw} "
+                          f"su {os.path.basename(p)}")
+                    anomaly = F.interpolate(
+                        anomaly.unsqueeze(0), size=gt_hw,
+                        mode="bilinear", align_corners=False,
+                    ).squeeze(0)
 
-            pixel_logits = sw.finalize(orig_hw)  # [C, H, W]
+                print(f"  [SW:LIT] {os.path.basename(p)}: crops={n_crops} "
+                      f"orig={orig_hw} anomaly={tuple(anomaly.shape[-2:])} gt={gt_hw}")
 
-            if args.debug and not _first_image_done:
-                _dbg_tensor("pixel_logits finali (dopo finalize, float32)", pixel_logits)
-                # Con autocast float16 ci aspettiamo max << 35 (era ~35 senza autocast,
-                # ~17 con la vecchia media su overlap). Se ancora >10 l'autocast
-                # non ha effetto (es. device cpu o versione torch senza supporto).
-                pl_max = pixel_logits.max().item()
-                pl_mean = pixel_logits.mean().item()
-                if pl_max > 5.0:
-                    print(f"  [DBG:AUTOCAST] pixel_logits max={pl_max:.4f} — "
-                          f"alto, autocast potrebbe non essere attivo o efficace")
-                else:
-                    print(f"  [DBG:AUTOCAST] pixel_logits max={pl_max:.4f} mean={pl_mean:.4f} — "
-                          f"range compresso, autocast float16 attivo ✓")
+                if args.save_logits:
+                    pixel_logits_cache.append(
+                        pixel_logits.detach().cpu().to(torch.float16).numpy()
+                    )
 
-            anomaly = _anomaly_from_pixel_logits(
-                pixel_logits,
-                method=args.method,
-                temperature=args.temperature,
-            ).unsqueeze(0)  # [1, H, W]
+            # ── BRANCH A: SlidingWindow custom (default) ─────────────────────
+            else:
+                sw = SlidingWindow(img_size=min(H, W), device=device)
+                crops, origins, _ = sw.window_image(x)
+                n_crops = len(crops)
 
-            # --- Verifica shape anomaly vs GT ---
-            anomaly_hw = tuple(anomaly.shape[-2:])
-            gt_hw      = tuple(ood.shape[-2:])
-            if anomaly_hw != gt_hw:
-                print(f"  [WARN:SW_SHAPE] mismatch anomaly={anomaly_hw} gt={gt_hw} "
-                      f"su {os.path.basename(p)} — bilinear upsample applicato")
-                anomaly = F.interpolate(
-                    anomaly.unsqueeze(0),
-                    size=gt_hw,
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0)
+                if logits_h is None:
+                    logits_h, logits_w = H, W
+                    print(f"[SW] prima immagine: orig_hw={orig_hw} n_crops={n_crops} "
+                          f"crop_size={min(H,W)}x{min(H,W)}")
+                    print(f"[SW] origins: {origins}")
 
-            print(f"  [SW] {os.path.basename(p)}: crops={n_crops} orig={orig_hw} "
-                  f"anomaly={tuple(anomaly.shape[-2:])} gt={gt_hw}")
+                crop_idx = 0
+                _ac_dtype  = torch.float16 if device.type == "cuda" else torch.bfloat16
+                with torch.autocast(dtype=_ac_dtype, device_type=device.type):
+                    for batch in sw.iter_batches(crops, batch_size=args.sw_batch_size):
+                        batch = batch.to(device)
+                        ml, cl = model.forward_masks_and_classes(batch)
 
-            if args.save_logits:
-                pixel_logits_cache.append(
-                    pixel_logits.detach().cpu().to(torch.float16).numpy()
-                )
+                        if args.debug and not _first_image_done and crop_idx == 0:
+                            print(f"\n[DBG:SW] crop 0 — batch shape={tuple(batch.shape)}")
+                            _dbg_tensor("mask_logits (crop 0)", ml)
+                            _dbg_tensor("class_logits (crop 0)", cl)
+
+                        pl = SlidingWindow.to_pixel_logits(ml, cl, args.num_classes)
+
+                        if args.debug and not _first_image_done and crop_idx == 0:
+                            _dbg_tensor("pixel_logits dopo to_pixel_logits (crop 0)", pl)
+
+                        indices = list(range(crop_idx, crop_idx + batch.shape[0]))
+                        sw.accumulate(pl.float(), origins, orig_hw, indices)
+                        crop_idx += batch.shape[0]
+
+                pixel_logits = sw.finalize(orig_hw)  # [C, H, W]
+
+                if args.debug and not _first_image_done:
+                    _dbg_tensor("pixel_logits finali (dopo finalize, float32)", pixel_logits)
+                    pl_max = pixel_logits.max().item()
+                    pl_mean = pixel_logits.mean().item()
+                    if pl_max > 5.0:
+                        print(f"  [DBG:AUTOCAST] pixel_logits max={pl_max:.4f} — "
+                              f"alto, autocast potrebbe non essere attivo o efficace")
+                    else:
+                        print(f"  [DBG:AUTOCAST] pixel_logits max={pl_max:.4f} mean={pl_mean:.4f} — "
+                              f"range compresso, autocast float16 attivo ✓")
+
+                anomaly = _anomaly_from_pixel_logits(
+                    pixel_logits,
+                    method=args.method,
+                    temperature=args.temperature,
+                ).unsqueeze(0)  # [1, H, W]
+
+                anomaly_hw = tuple(anomaly.shape[-2:])
+                gt_hw      = tuple(ood.shape[-2:])
+                if anomaly_hw != gt_hw:
+                    print(f"  [WARN:SW_SHAPE] mismatch anomaly={anomaly_hw} gt={gt_hw} "
+                          f"su {os.path.basename(p)} — bilinear upsample applicato")
+                    anomaly = F.interpolate(
+                        anomaly.unsqueeze(0),
+                        size=gt_hw,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+
+                print(f"  [SW] {os.path.basename(p)}: crops={n_crops} orig={orig_hw} "
+                      f"anomaly={tuple(anomaly.shape[-2:])} gt={gt_hw}")
+
+                if args.save_logits:
+                    pixel_logits_cache.append(
+                        pixel_logits.detach().cpu().to(torch.float16).numpy()
+                    )
 
         # --- Debug anomaly scores sulla prima immagine elaborata ---
         if args.debug and not _first_image_done:

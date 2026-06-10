@@ -180,44 +180,63 @@ def main():
         if not p.exists():
             raise FileNotFoundError(f"Missing cache file: {p}")
 
-    # Float16 -> float32 to avoid precision loss in softmax / log / tanh.
-    pixel_logits = torch.from_numpy(
-        np.load(pl_path).astype(np.float32)
-    ).to(device)   # [N, C, H_model, W_model]
+    # Memory-map both arrays so we can process them image by image without
+    # ever holding the full dataset on the GPU. The full-dataset path was
+    # tried first but produced OOMs on datasets such as LostAndFound where
+    # the model-resolution logits (e.g. 512x1024) get upsampled to the GT
+    # resolution (e.g. 1024x2048) and the dense [N, C, H, W] tensor in
+    # float32 exceeds tens of gigabytes.
+    pixel_logits_np = np.load(pl_path, mmap_mode="r")   # [N, C, H_model, W_model] float16
+    gt              = np.load(gt_path)                  # [N, H_gt, W_gt] uint8
 
-    gt = np.load(gt_path)  # [N, H_gt, W_gt] uint8
+    N           = pixel_logits_np.shape[0]
+    gt_h, gt_w  = int(gt.shape[-2]), int(gt.shape[-1])
+    model_h, model_w = int(pixel_logits_np.shape[-2]), int(pixel_logits_np.shape[-1])
+    need_upsample = (model_h, model_w) != (gt_h, gt_w)
 
-    # The cache stores logits at the MODEL resolution, while the GT lives
-    # at the original image resolution. Align them by bilinearly
-    # upsampling the logits to the GT spatial size before computing
-    # anomaly maps. This is the same operation the main runner performs
-    # on the anomaly map (just done here on the logits, which is
-    # equivalent because all per-pixel methods are pointwise in (H, W)).
-    gt_h, gt_w = int(gt.shape[-2]), int(gt.shape[-1])
-    if pixel_logits.shape[-2:] != (gt_h, gt_w):
-        print(f"[INFO] upsampling pixel_logits {tuple(pixel_logits.shape[-2:])} "
-              f"-> {(gt_h, gt_w)} (bilinear)")
-        pixel_logits = F.interpolate(
-            pixel_logits, size=(gt_h, gt_w),
-            mode="bilinear", align_corners=False,
-        )
+    if need_upsample:
+        print(f"[INFO] will upsample pixel_logits {(model_h, model_w)} "
+              f"-> {(gt_h, gt_w)} per image (bilinear)")
+    print(f"[INFO] N={N} images, processing one at a time on {device}")
 
     # ── Output directory ─────────────────────────────────────────────────
     sweep_dir = run_root / "sweep" / f"{args.method}__sw__{args.mode}"
     sweep_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Run the sweep ────────────────────────────────────────────────────
+    # For every temperature we accumulate two flat 1D arrays in float32:
+    # one with anomaly scores for InD pixels, one for OOD pixels. We never
+    # need to keep full anomaly maps in memory, which makes this loop fit
+    # in O(InD + OOD) RAM regardless of resolution.
     sweep_rows = []
 
     for Tv in T_list:
-        anomaly = anomaly_from_pixel_logits_t(
-            pixel_logits, method=args.method, T=Tv
-        ).cpu().numpy()   # [N, H, W]
+        ind_buf, ood_buf = [], []
 
-        # Pool all valid (non-255) pixels across the dataset and compute
-        # AUPRC + FPR@95TPR, same convention as the main runner.
-        ood_out = anomaly[gt == 1]
-        in_out  = anomaly[gt == 0]
+        for i in range(N):
+            # Load one image to GPU as float32. Shape [1, C, H_model, W_model].
+            pl_i = torch.from_numpy(
+                pixel_logits_np[i].astype(np.float32)
+            ).unsqueeze(0).to(device)
+
+            if need_upsample:
+                pl_i = F.interpolate(
+                    pl_i, size=(gt_h, gt_w),
+                    mode="bilinear", align_corners=False,
+                )
+
+            anomaly_i = anomaly_from_pixel_logits_t(
+                pl_i, method=args.method, T=Tv
+            ).squeeze(0).cpu().numpy()  # [H_gt, W_gt]
+
+            gt_i = gt[i]
+            ind_buf.append(anomaly_i[gt_i == 0])
+            ood_buf.append(anomaly_i[gt_i == 1])
+
+            del pl_i, anomaly_i
+
+        in_out  = np.concatenate(ind_buf) if ind_buf else np.empty(0)
+        ood_out = np.concatenate(ood_buf) if ood_buf else np.empty(0)
 
         val_out   = np.concatenate([in_out, ood_out])
         val_label = np.concatenate([np.zeros(len(in_out)), np.ones(len(ood_out))])

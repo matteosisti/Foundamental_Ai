@@ -8,9 +8,11 @@
 # temperatures, without re-running the model.
 #
 # Cached files used (under <run_dir>/logits/):
-#   * {dataset}__pixel_logits_f16.npy : [N, C, H, W] float16 — per-image
-#     per-pixel logits already recomposed at the original image
-#     resolution. The "pixel logits" here are the output of
+#   * {dataset}__pixel_logits_f16.npy : [N, C, H_model, W_model] float16 —
+#     per-image per-pixel logits at the MODEL resolution (e.g. 512x1024
+#     after the SW preprocessing), NOT at the original image resolution.
+#     Anomaly maps are bilinearly upsampled to the GT resolution before
+#     scoring. The "pixel logits" here are the output of
 #     sigmoid(mask) @ softmax(class), so they live in [0, ~1]; see
 #     run_eomt_eval.py for the rationale.
 #   * {dataset}__gt.npy               : [N, H, W] uint8 — ground truth
@@ -181,9 +183,24 @@ def main():
     # Float16 -> float32 to avoid precision loss in softmax / log / tanh.
     pixel_logits = torch.from_numpy(
         np.load(pl_path).astype(np.float32)
-    ).to(device)   # [N, C, H, W]
+    ).to(device)   # [N, C, H_model, W_model]
 
-    gt = np.load(gt_path)  # [N, H, W] uint8
+    gt = np.load(gt_path)  # [N, H_gt, W_gt] uint8
+
+    # The cache stores logits at the MODEL resolution, while the GT lives
+    # at the original image resolution. Align them by bilinearly
+    # upsampling the logits to the GT spatial size before computing
+    # anomaly maps. This is the same operation the main runner performs
+    # on the anomaly map (just done here on the logits, which is
+    # equivalent because all per-pixel methods are pointwise in (H, W)).
+    gt_h, gt_w = int(gt.shape[-2]), int(gt.shape[-1])
+    if pixel_logits.shape[-2:] != (gt_h, gt_w):
+        print(f"[INFO] upsampling pixel_logits {tuple(pixel_logits.shape[-2:])} "
+              f"-> {(gt_h, gt_w)} (bilinear)")
+        pixel_logits = F.interpolate(
+            pixel_logits, size=(gt_h, gt_w),
+            mode="bilinear", align_corners=False,
+        )
 
     # ── Output directory ─────────────────────────────────────────────────
     sweep_dir = run_root / "sweep" / f"{args.method}__sw__{args.mode}"

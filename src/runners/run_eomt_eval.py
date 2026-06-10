@@ -206,6 +206,12 @@ def main():
                          "input_transform Resize(512,1024) + uint8 + model.load_state_dict "
                          "sul wrapper + get_eomt_logits con autocast float16. "
                          "Completamente indipendente dal branch --lightning-sw.")
+    ap.add_argument("--interp-pos-embed", action="store_true",
+                    help="BRANCH A-interp: nel load di EoMTWrapper interpola bicubicamente "
+                         "il pos_embed del checkpoint (es. 64x64 da 1024) alla griglia del "
+                         "modello (es. 40x40 a 640) invece di scartarlo per shape mismatch. "
+                         "Tecnica da evalAnomalyStep8 (fossanetti). Ha effetto solo sul "
+                         "branch A (EoMTWrapper), ignorato con --lightning-sw/--lightning-v2.")
 
     args = ap.parse_args()
 
@@ -259,6 +265,7 @@ def main():
     print(f"[SESSION] no_totensor={args.no_totensor}  (uint8 [0,255] → modello)")
     print(f"[SESSION] lightning_sw={args.lightning_sw}  (usa window_imgs_semantic del Lightning module)")
     print(f"[SESSION] lightning_v2={args.lightning_v2}  (replica esatta STEP8_Cityscapes_Coco)")
+    print(f"[SESSION] interp_pos_embed={args.interp_pos_embed}  (branch A: pos_embed bicubic 64x64->target)")
     print("=" * 60)
 
     ckpt_basename = os.path.basename(args.ckpt)
@@ -471,6 +478,10 @@ def main():
         print(f"[MODEL][v2] ✓  img_size={_v2_img_size}")
 
     else:
+        # ── BRANCH A: EoMTWrapper custom (default) ───────────────────────────
+        # Con --interp-pos-embed diventa "branch A-interp": stesso wrapper,
+        # ma il pos_embed del checkpoint viene interpolato alla griglia 640
+        # invece di essere scartato (missing=1 → missing=0).
         model = EoMTWrapper(
             img_size=size_hw,
             num_classes=args.num_classes,
@@ -479,7 +490,8 @@ def main():
             backbone_name=backbone,
             masked_attn_enabled=True,
         )
-        model.load(args.ckpt, device)
+        model.load(args.ckpt, device,
+                   interp_pos_embed=bool(args.interp_pos_embed))
 
     # PATCH — eval mode sul wrapper
     # EoMTWrapper.load() chiama .eval() solo su self.net (il modello interno),
@@ -648,7 +660,11 @@ def main():
                         print(f"[SW:V2] prima immagine: orig_hw={orig_hw} "
                               f"n_crops={n_crops} origins={origins_v2}")
 
-                    ml_v2, cl_v2 = model.network(crops_v2)
+                    # FIX CRITICO: model(crops) NON model.network(crops)!
+                    # LightningModule.forward fa: x = imgs / 255.0; return self.network(x)
+                    # Bypassare il wrapper salta la divisione per 255 → input [0,255]
+                    # al network → normalizzazione ImageNet sballata → logits collassati.
+                    ml_v2, cl_v2 = model(crops_v2)
                     ml_v2_interp = F.interpolate(
                         ml_v2[-1], _v2_target, mode="bilinear"
                     )
@@ -727,7 +743,8 @@ def main():
                         print(f"[SW:LIT] prima immagine: orig_hw={orig_hw} "
                               f"n_crops={n_crops} origins={origins_lit}")
 
-                    mask_logits_layers, class_logits_layers = model.network(crops_lit)
+                    # FIX CRITICO: model(crops) passa per Lightning forward che fa /255
+                    mask_logits_layers, class_logits_layers = model(crops_lit)
                     mask_logits_lit = F.interpolate(
                         mask_logits_layers[-1], model.img_size, mode="bilinear"
                     )

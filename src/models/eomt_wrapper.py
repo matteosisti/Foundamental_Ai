@@ -73,7 +73,54 @@ def _clean_state_dict_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Te
     return clean
 
 
-def _load_weights_robust(model: nn.Module, ckpt_path: str, device: torch.device) -> Tuple[int, int]:
+def _interp_pos_embed_to_model(
+    state: Dict[str, torch.Tensor],
+    model: nn.Module,
+) -> Dict[str, torch.Tensor]:
+    """
+    BRANCH A-interp (da fossanetti, evalAnomalyStep8.ipynb):
+    interpola bicubicamente il pos_embed del checkpoint alla griglia del modello,
+    invece di scartarlo per shape mismatch.
+
+    Esempio: checkpoint Cityscapes trainato a 1024x1024 → pos_embed [1, 4096, 768]
+    (griglia 64x64). Modello istanziato a 640x640 → atteso [1, 1600, 768] (40x40).
+    Senza interpolazione il load fuzzy scarta il pos_embed trainato e il modello
+    usa quello DINOv2-pretrained di timm (non finetuned su Cityscapes).
+    """
+    import torch.nn.functional as F
+
+    own = model.state_dict()
+    out = dict(state)
+
+    for k, v in state.items():
+        if "pos_embed" not in k or not isinstance(v, torch.Tensor) or v.dim() != 3:
+            continue
+        if k not in own:
+            continue
+        tgt = own[k]
+        if tgt.shape == v.shape:
+            continue  # nessun mismatch, niente da fare
+
+        # entrambe devono essere griglie quadrate [1, g*g, C]
+        g_src = round(v.shape[1] ** 0.5)
+        g_tgt = round(tgt.shape[1] ** 0.5)
+        if g_src * g_src != v.shape[1] or g_tgt * g_tgt != tgt.shape[1]:
+            print(f"[EoMT][interp] {k}: griglia non quadrata "
+                  f"(src={v.shape[1]}, tgt={tgt.shape[1]}) — skip")
+            continue
+
+        C = v.shape[2]
+        pe = v.reshape(1, g_src, g_src, C).permute(0, 3, 1, 2)          # [1,C,g,g]
+        pe = F.interpolate(pe, size=(g_tgt, g_tgt),
+                           mode="bicubic", align_corners=False)
+        out[k] = pe.permute(0, 2, 3, 1).reshape(1, g_tgt * g_tgt, C)
+        print(f"[EoMT][interp] {k}: {g_src}x{g_src} -> {g_tgt}x{g_tgt} (bicubic)")
+
+    return out
+
+
+def _load_weights_robust(model: nn.Module, ckpt_path: str, device: torch.device,
+                         interp_pos_embed: bool = False) -> Tuple[int, int]:
     """
     Fuzzy weight loading:
     - Accepts checkpoints with mismatched keys.
@@ -83,6 +130,11 @@ def _load_weights_robust(model: nn.Module, ckpt_path: str, device: torch.device)
     """
     raw = torch.load(ckpt_path, map_location="cpu")
     state = _clean_state_dict_keys(_unwrap_state_dict(raw))
+
+    # BRANCH A-interp: porta il pos_embed del checkpoint alla griglia del modello
+    # PRIMA del matching per shape, così non viene scartato.
+    if interp_pos_embed:
+        state = _interp_pos_embed_to_model(state, model)
 
     own = model.state_dict()
     loadable = {}
@@ -157,18 +209,24 @@ class EoMTWrapper(nn.Module):
         self.backbone_name = backbone_name
         self.masked_attn_enabled = masked_attn_enabled
 
-    def load(self, ckpt_path: str, device: torch.device, mode: str = "robust") -> None:
+    def load(self, ckpt_path: str, device: torch.device, mode: str = "robust",
+             interp_pos_embed: bool = False) -> None:
         """
         Loads model weights.
         'mode' can be 'prof-exact' for strict loading or 'robust' for fuzzy matching.
+        'interp_pos_embed=True' (BRANCH A-interp): interpola bicubicamente il
+        pos_embed del checkpoint alla griglia del modello invece di scartarlo.
+        Default False → comportamento storico invariato.
         """
         mode = mode.lower()
         if mode == "prof-exact":
             _load_weights_prof_exact(self.net, ckpt_path, device)
             print(f"[EoMT][prof-exact] Loaded STRICT weights from: {ckpt_path}")
         else:
-            miss, unexp = _load_weights_robust(self.net, ckpt_path, device)
-            print(f"[EoMT][robust] Loaded fuzzy weights from: {ckpt_path} | missing={miss} unexpected={unexp}")
+            miss, unexp = _load_weights_robust(self.net, ckpt_path, device,
+                                               interp_pos_embed=interp_pos_embed)
+            tag = "robust+interp" if interp_pos_embed else "robust"
+            print(f"[EoMT][{tag}] Loaded fuzzy weights from: {ckpt_path} | missing={miss} unexpected={unexp}")
 
         # PATCH — eval mode sul wrapper
         # _load_weights_robust / _load_weights_prof_exact chiamano .eval() solo su

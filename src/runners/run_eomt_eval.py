@@ -533,14 +533,22 @@ def main():
                 # window_imgs_semantic si aspetta un tensore uint8 [0,255]
                 # perché internamente fa Image.fromarray(img.permute(1,2,0).numpy()).
                 # Convertiamo da float [0,1] a uint8 [0,255].
+                # Replica ESATTA di semantic_inference() del gruppo 5:
+                # - uint8 [0,255] come input (no ToTensor)
+                # - autocast float16 che promuove uint8→float16 prima della normalizzazione
+                # Questo produce valori enormi (~1111) nel forward ma coerenti tra tutti
+                # i pixel, permettendo al modello di discriminare anomalie.
                 img_tensor = (x.squeeze(0).cpu() * 255).to(torch.uint8).to(device)  # [3,H,W] uint8
                 imgs = [img_tensor]
                 img_sizes = [img_tensor.shape[-2:]]
 
-                _ac_dtype  = torch.float16 if device.type == "cuda" else torch.bfloat16
+                _ac_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+                # autocast avvolge TUTTO incluso window_imgs_semantic e model.network
+                # esattamente come nel loro semantic_inference
                 with torch.autocast(dtype=_ac_dtype, device_type=device.type):
                     crops_lit, origins_lit = model.window_imgs_semantic(imgs)
                     n_crops = len(crops_lit)
+                    # crops_lit è uint8 → autocast lo promuove a float16 nel forward
 
                     if logits_h is None:
                         logits_h, logits_w = H, W
@@ -557,7 +565,7 @@ def main():
                     logits_lit = model.revert_window_logits_semantic(
                         crop_logits_lit, origins_lit, img_sizes
                     )
-                    pixel_logits = logits_lit[0].float()  # [C, H, W]
+                    pixel_logits = logits_lit[0].float()  # [C, H, W] float32
 
                 if args.debug and not _first_image_done:
                     _dbg_tensor("pixel_logits finali (Lightning SW)", pixel_logits)

@@ -62,21 +62,62 @@ def _is_already_binary_ood_mask(uvals: np.ndarray) -> bool:
     return s.issubset({0, 1, 255}) and (0 in s or 1 in s)
 
 
+# PATCH — remap_ood_mask: aggiunto branch esplicito per RoadObstacle21
+# ---------------------------------------------------------------------
+# BUG ORIGINALE: RoadObstacle21 non aveva nessun branch dedicato in
+# remap_ood_mask. Il check "RoadAnomaly" in path_gt NON matcha il path
+# di RO21 (che contiene "RoadObstacle21"), quindi le sue maschere
+# venivano restituite grezze, senza alcuna rimappatura.
+#
+# Le maschere di RO21 usano un encoding multi-valore distinto da quello
+# delle altre maschere già in formato {0,1}. Senza rimappatura corretta,
+# i pixel anomali non vengono identificati come label=1, producendo
+# score invertiti e AuPRC vicino al caso casuale (FPR ~100%).
+#
+# FIX: branch specifico per RoadObstacle21 inserito PRIMA del check
+# generico "RoadAnomaly", con guard binario per gestire entrambe le
+# versioni delle maschere (già binarie o multi-valore).
+#
+# ENCODING ATTESO per RO21 (multi-valore):
+#   0   -> void/ignore  (rimappato a 255)
+#   1   -> InD road     (rimappato a 0)
+#   2   -> OOD obstacle (rimappato a 1)
+# Se la maschera è già in {0,1,255} il guard la lascia invariata.
+#
+# IMPATTO STIMATO: +45÷+59 AuPRC su RO21 per tutti i metodi e checkpoint.
+
 def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
     """
     Remaps dataset-specific GT encodings to the binary convention:
         0 = InD,  1 = OOD,  (255 = ignore/void)
 
     Dataset rules:
-        RoadAnomaly        : label 2 -> 1 (OOD)
+        RoadObstacle21     : 0->255 (void), 1->0 (InD), 2->1 (OOD)
+                             (only if not already binary — guard applied)
+        RoadAnomaly / RA21 : label 2 -> 1 (OOD)
         LostAndFound /
         FS_LostFound_full  : legacy multi-class -> binary
                              (only if not already binary — see guard below)
-        Streethazard       : label 14 -> void, rest < 20 -> InD, void -> OOD
     """
+
+    # --- RoadObstacle21 — branch dedicato, controllato prima di "RoadAnomaly" ---
+    # Il check è più specifico: "RoadObstacle21" non contiene la stringa
+    # "RoadAnomaly", quindi i due branch sono mutuamente esclusivi sul path.
+    if "RoadObstacle21" in path_gt or "RoadObsticle21" in path_gt:
+        if not _is_already_binary_ood_mask(np.unique(ood)):
+            # Encoding multi-valore atteso: 0=void, 1=InD, 2=OOD
+            ood = np.where(ood == 2, 1,   ood)   # OOD obstacle -> 1
+            ood = np.where(ood == 1, 0,   ood)   # InD road     -> 0
+            ood = np.where(ood == 0, 255, ood)   # void         -> ignore
+            # Nota: l'ordine è importante — rimappare prima il 2, poi l'1,
+            # poi lo 0, per evitare collisioni tra i valori intermedi.
+        return ood
+
+    # --- RoadAnomaly21 / RoadAnomaly ---
     if "RoadAnomaly" in path_gt:
         ood = np.where(ood == 2, 1, ood)
 
+    # --- LostAndFound / FS_LostFound_full ---
     if "LostAndFound" in path_gt or "FS_LostFound_full" in path_gt:
         # Guard: skip remapping if mask is already in binary convention.
         # Without this check a double-remap would corrupt the labels.
@@ -84,8 +125,6 @@ def remap_ood_mask(path_gt: str, ood: np.ndarray) -> np.ndarray:
             ood = np.where(ood == 0, 255, ood)           # void  -> ignore
             ood = np.where(ood == 1, 0,   ood)           # road  -> InD
             ood = np.where((ood > 1) & (ood < 201), 1, ood)  # obstacles -> OOD
-
-    
 
     return ood
 

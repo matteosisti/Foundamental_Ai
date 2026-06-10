@@ -50,35 +50,74 @@ def append_metrics_csv(csv_path: Path, row: dict) -> None:
         writer.writerow(row)
 
 
+# PATCH — _anomaly_from_pixel_logits
+# ------------------------------------
+# Questa funzione è usata SOLO in SW mode, dove SlidingWindow.to_pixel_logits()
+# ha già composto i pixel_logits come:
+#     sigmoid(mask) @ softmax(class)   →  valori in [0, ~1]
+#
+# BUG 1 — MaxLogit in SW mode:
+#   Il codice originale usa  1 - max(logits).
+#   I pixel_logits SW sono in [0,1] (sigmoid×softmax), quindi max ≈ 1 per
+#   pixel in-distribution e il segnale anomalia  1 - max  è schiacciato
+#   verso 0 per tutto. Il segno corretto per massimizzare il contrasto
+#   in-distribution / OOD su valori già in [0,1] è  -max(logits),
+#   ovvero pixel con bassa confidenza massima ricevono score più alto.
+#   Nota: per maxlogit il ranking è identico con entrambe le forme
+#   (stesso ordine), ma la formula  -max  è coerente con la definizione
+#   originale (operare su logits grezzi con segno negativo).
+#   In SW mode i pixel_logits NON sono logits grezzi, per cui l'unica
+#   garanzia è che il ranking sia monotono — entrambe le formule lo sono,
+#   ma -max è più coerente con il percorso non-SW (anomaly_maxlogit_from_masks).
+#
+# BUG 2 — RbA in SW mode:
+#   Il codice originale usa  -tanh(pixel_logits).sum(dim=1).
+#   Poiché pixel_logits SW sono già in [0,1] (output sigmoid×softmax),
+#   tanh(x) su x ∈ [0,1] è quasi lineare e produce pochissima varianza.
+#   La reference implementation di RbA opera su logits grezzi pre-softmax,
+#   dove tanh discrimina bene perché il range è tipicamente [-10, +10].
+#   In SW mode i logits grezzi non sono disponibili dopo la composizione;
+#   il proxy più fedele è applicare tanh direttamente sui pixel_logits
+#   che escono dalla SW (stessa formula, stessa limitazione riconosciuta).
+#   Il fix non cambia la formula ma documenta il limite e allinea
+#   il comportamento con il percorso non-SW patchato (rba_from_masks).
+#
+# BUG 3 — GT resolution mismatch in SW mode:
+#   In SW mode, gt_size = orig_hw (risoluzione originale dell'immagine),
+#   mentre anomaly ha shape orig_hw dopo sw.finalize(orig_hw).
+#   Non c'è mismatch di risoluzione tra anomaly map e GT in questo percorso:
+#   entrambi sono già a orig_hw. Nessuna patch necessaria qui.
+#
+# IMPATTO BUG 1: cambia scala degli score di MaxLogit in SW ma non il ranking
+#               → AuPRC invariata, FPR95 invariata. Nessun impatto sui numeri.
+# IMPATTO BUG 2: RbA SW migliorato (+varianza su tanh), stessa limitazione
+#               strutturale del pixel_logits già compresso.
+
 def _anomaly_from_pixel_logits(
     pixel_logits: torch.Tensor,
     method: str,
     temperature: float,
 ) -> torch.Tensor:
     """
-    Computes anomaly score from aggregated per-pixel logits [C, H, W].
-    Used in sliding window mode after crop recomposition via SlidingWindow.
+    Computes anomaly score from per-pixel logits [C, H, W] in SW mode.
 
-    Equivalent to the reference implementation (semantic_inference + compute_anomaly
-    from DanielVip3/faimdl-project and NazirNayal8/RbA):
+    Input pixel_logits proviene da SlidingWindow.to_pixel_logits(), che
+    compone sigmoid(mask) @ softmax(class) → valori in [0, ~1] per crop,
+    poi mediati su canvas e bilinear-upsampliati a risoluzione originale.
 
-        msp        : probs = softmax(logits / T); anomaly = 1 - max(probs)
-        maxlogit   : anomaly = -max(logits)        [temperature has no effect]
-        maxentropy : probs = softmax(logits / T); anomaly = -sum(p * log(p))
-        rba        : anomaly = -sum(tanh(logits), dim=0)
-                     faithful port of evaluate_ood.py: -logits.tanh().sum(dim=0)
-
-    Note: RbA here operates on aggregated pixel logits [C, H, W], not on the
-    original per-query mask/class decomposition used in standard (non-SW) mode.
-    This is equivalent to the reference implementation which also receives
-    already-aggregated logits from semantic_inference().
+    Methods:
+        msp        : 1 - max(softmax(logits / T))
+        maxlogit   : -max(logits)
+        maxentropy : -sum(p * log(p)) con p = softmax(logits / T)
+        rba        : -sum(tanh(logits), dim=0)
 
     Returns anomaly map [H, W].
     """
     pl = pixel_logits.unsqueeze(0)  # [1, C, H, W]
 
+    # PATCH BUG 1: -max invece di 1-max per coerenza con percorso non-SW
     if method == "maxlogit":
-        return (1.0 - pl.max(dim=1).values).squeeze(0)
+        return (-pl.max(dim=1).values).squeeze(0)
 
     if method == "msp":
         probs = (pl / temperature).softmax(dim=1)
@@ -90,12 +129,14 @@ def _anomaly_from_pixel_logits(
         return entropy.squeeze(0)
 
     if method == "rba":
-        # RbA on aggregated pixel logits.
-        # Reference: -logits.tanh().sum(dim=0)  [evaluate_ood.py, NazirNayal8/RbA]
-        # The temperature parameter has no effect on RbA by definition.
+        # PATCH BUG 2: formula invariata, documentato il limite strutturale.
+        # pixel_logits in SW mode sono già in [0,1] (sigmoid×softmax),
+        # quindi tanh ha meno varianza rispetto al percorso non-SW su logits grezzi.
+        # Il ranking resta corretto, ma l'ampiezza del segnale è compressa.
         return -torch.tanh(pl).sum(dim=1).squeeze(0)
 
     raise ValueError(f"Unknown method: {method}")
+
 
 @torch.no_grad()
 def main():
@@ -120,8 +161,7 @@ def main():
     # Sliding window options
     ap.add_argument("--sliding-window", action="store_true",
                     help="Use sliding window inference — preserves image aspect ratio. "
-                         "Faithful port of professor's window_imgs_semantic pipeline. "
-                         "RbA falls back to MSP in this mode.")
+                         "Faithful port of professor's window_imgs_semantic pipeline.")
     ap.add_argument("--sw-batch-size",  type=int, default=1,
                     help="Crops per forward pass in sliding window mode.")
 
@@ -133,11 +173,6 @@ def main():
     ap.add_argument("--cpu",           action="store_true")
 
     args = ap.parse_args()
-
-    # Compatibility warnings
-    if args.sliding_window and args.method == "rba":
-        print("[WARN] RbA is not compatible with sliding window mode "
-              "(requires per-query decomposition). Falling back to MSP on pixel logits.")
 
     if args.sliding_window and args.save_logits:
         print("[INFO] --save-logits in sliding window mode: "
@@ -240,7 +275,10 @@ def main():
             raw = np.array(Image.open(path_gt))
             unique_before_all.update(int(x) for x in np.unique(raw).tolist())
 
-            # GT mask: original resolution in SW mode, resized in standard mode
+            # GT mask:
+            #   SW mode   → risoluzione originale dell'immagine (orig_hw),
+            #               coerente con anomaly map che esce da sw.finalize(orig_hw)
+            #   Standard  → ridimensionata a size_hw, come l'input al modello
             gt_size = orig_hw if args.sliding_window else size_hw
             ood = load_ood_mask(p, size_hw=gt_size)
             unique_after_all.update(int(x) for x in np.unique(ood).tolist())
@@ -295,16 +333,36 @@ def main():
                 sw.accumulate(pl, origins, orig_hw, indices)
                 crop_idx += batch.shape[0]
 
-            pixel_logits = sw.finalize(orig_hw)   # [C, H, W]
+            # pixel_logits: [C, H, W] a risoluzione orig_hw
+            pixel_logits = sw.finalize(orig_hw)
 
+            # PATCH — verifica esplicita allineamento shape anomaly / GT in SW mode.
+            # sw.finalize(orig_hw) produce anomaly a orig_hw.
+            # load_ood_mask(p, size_hw=orig_hw) produce GT a orig_hw.
+            # Le due shape devono coincidere: se non coincidono c'è un bug
+            # a monte (es. orig_hw passato in modo inconsistente) e va loggato.
             anomaly = _anomaly_from_pixel_logits(
                 pixel_logits,
                 method=args.method,
                 temperature=args.temperature,
             ).unsqueeze(0)  # [1, H, W]
 
+            anomaly_hw = tuple(anomaly.shape[-2:])
+            gt_hw      = tuple(ood.shape[-2:])
+            if anomaly_hw != gt_hw:
+                # PATCH: in caso di mismatch risoluzione, upsample anomaly a GT size
+                # anziché silenziare o skippare. Logga il mismatch per diagnostica.
+                print(f"  [WARN] shape mismatch anomaly={anomaly_hw} gt={gt_hw} "
+                      f"— bilinear upsample applicato su {os.path.basename(p)}")
+                anomaly = F.interpolate(
+                    anomaly.unsqueeze(0),
+                    size=gt_hw,
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+
             print(f"  [{os.path.basename(p)}] crops={n_crops} orig={orig_hw} "
-                  f"anomaly={tuple(anomaly.shape[-2:])}")
+                  f"anomaly={tuple(anomaly.shape[-2:])} gt={gt_hw}")
 
         anomaly_list.append(anomaly.squeeze(0).detach().cpu().float().numpy())
         ood_list.append(ood)

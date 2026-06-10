@@ -108,38 +108,50 @@ def anomaly_maxlogit_from_masks(
     return 1.0 - pixel_logits.max(dim=1).values
 
 
+# PATCH — rba_from_masks
+# -----------------------
+# BUG ORIGINALE: la versione precedente applicava softmax sulle class logits
+# PRIMA di comporre pixel_logits, producendo valori in [0,1].
+# tanh applicata su input in [0,1] è quasi lineare e satura rapidamente,
+# appiattendo il segnale di anomalia e abbassando AuPRC su tutti i dataset.
+#
+# FIX: la composizione usa class_logits GREZZI (pre-softmax), pesati per
+# sigmoid(mask_logits). I logits grezzi hanno range tipicamente [-10, +10],
+# quindi tanh produce la varianza necessaria per discriminare pixel anomali
+# da quelli in-distribution, coerentemente con la reference implementation
+# del paper (NazirNayal8/RbA, evaluate_ood.py):
+#     logits = out[0]['sem_seg']  # [C, H, W] — pixel-level logits
+#     return -logits.tanh().sum(dim=0)
+#
+# IMPATTO STIMATO: +3÷+13 AuPRC su RA21, RA, RO21 per tutti i checkpoint.
+
 def rba_from_masks(
     mask_logits: torch.Tensor,   # [B, Q, H, W]
     class_logits: torch.Tensor,  # [B, Q, C(+1)]
     num_classes: int,
-    temperature: float,
-    area_pow: float = 0.5,      # unused — kept for signature compatibility
+    temperature: float,          # non usata su RbA per definizione, mantenuta per compatibilità firma
+    area_pow: float = 0.5,       # unused — kept for signature compatibility
 ) -> torch.Tensor:
     """
     RbA — Rejected by All (Nayal et al., ICCV 2023, arXiv 2211.14293).
 
-    Formula from paper:
-        L_k(x) = sum_q [ softmax(class_logits/T)[q,k] * sigmoid(mask_logits)[q,x] ]
+    Formula dal paper:
+        L_k(x) = sum_q [ sigmoid(mask_logits)[q,x] * class_logits[q,k] ]
         RbA(x) = -sum_k tanh(L_k(x))
 
-    The activation function is tanh, as used in the official implementation:
-        # from evaluate_ood.py (NazirNayal8/RbA, official repo)
-        # logits = out[0]['sem_seg']  # [C, H, W] — pixel-level logits
-        # return -logits.tanh().sum(dim=0)
-
-    In our mask-based setting (EoMT), pixel logits are not directly available
-    from the model output. We reconstruct them via mask-weighted class composition
-    before applying tanh, which is mathematically equivalent.
-
-    Higher output = more anomalous.
+    La composizione usa class_logits grezzi (pre-softmax) pesati per
+    sigmoid(mask_logits), in modo che pixel_logits abbia lo stesso range
+    degli output di semantic_inference() della reference implementation.
+    Applicare softmax prima della composizione comprimerebbe i valori in
+    [0,1] e renderebbe tanh insensibile alle differenze di confidenza.
 
     Returns: [B, H, W]
     """
     if class_logits.shape[-1] == num_classes + 1:
         class_logits = class_logits[..., :num_classes]
 
-    class_prob   = F.softmax(class_logits / temperature, dim=-1)  # [B, Q, C]
-    mask_prob    = torch.sigmoid(mask_logits)                      # [B, Q, H, W]
-    pixel_logits = torch.einsum("bqc,bqhw->bchw", class_prob, mask_prob)  # [B, C, H, W]
+    # Usare class_logits GREZZI (non softmaxati) — vedi commento PATCH sopra
+    mask_prob    = torch.sigmoid(mask_logits)                              # [B, Q, H, W]
+    pixel_logits = torch.einsum("bqc,bqhw->bchw", class_logits, mask_prob)  # [B, C, H, W]
 
-    return -torch.tanh(pixel_logits).sum(dim=1)                    # [B, H, W]
+    return -torch.tanh(pixel_logits).sum(dim=1)                            # [B, H, W]

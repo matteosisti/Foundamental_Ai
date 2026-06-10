@@ -193,6 +193,9 @@ def main():
     # Flag debug: stampa info dettagliate per ogni immagine
     ap.add_argument("--debug", action="store_true",
                     help="Abilita print dettagliato per GT mask, logits, anomaly scores.")
+    ap.add_argument("--no-totensor", action="store_true",
+                    help="NON divide per 255 — passa uint8 [0,255] al modello come fa il gruppo 5. "
+                         "Solo per confronto sperimentale.")
 
     args = ap.parse_args()
 
@@ -217,10 +220,22 @@ def main():
 
     size_hw = (H, W)
 
+    # PATCH --no-totensor: replica il comportamento del gruppo 5 che passa
+    # uint8 [0,255] direttamente al modello senza ToTensor() (divisione per 255).
+    # Il modello EoMT fa internamente (x - mean) / std aspettandosi [0,1] float,
+    # ma con [0,255] uint8 i logits escono con range molto più ampio.
+    # Usare SOLO per confronto sperimentale — non è il comportamento corretto.
     if not args.sliding_window:
-        input_transform = Compose([Resize(size_hw, Image.BILINEAR), ToTensor()])
+        if args.no_totensor:
+            # uint8 [0,255] come gruppo 5: Resize PIL → np.array → permute → float (no /255)
+            input_transform = Compose([Resize(size_hw, Image.BILINEAR)])
+        else:
+            input_transform = Compose([Resize(size_hw, Image.BILINEAR), ToTensor()])
     else:
-        input_transform = ToTensor()
+        if args.no_totensor:
+            input_transform = None  # gestito inline sotto
+        else:
+            input_transform = ToTensor()
 
     # --- Header di sessione ---
     print("=" * 60)
@@ -231,6 +246,7 @@ def main():
     print(f"[SESSION] resize={H}x{W} num_classes={args.num_classes}")
     print(f"[SESSION] device={device} seed={args.seed} deterministic={want_determinism}")
     print(f"[SESSION] debug={args.debug}")
+    print(f"[SESSION] no_totensor={args.no_totensor}  (uint8 [0,255] → modello)")
     print("=" * 60)
 
     ckpt_basename = os.path.basename(args.ckpt)
@@ -356,7 +372,17 @@ def main():
             n_skipped_no_ood += 1
             continue
 
-        x = input_transform(img_pil).unsqueeze(0).float().to(device)
+        # Costruzione tensore input
+        if args.no_totensor:
+            # Replica gruppo 5: PIL → np.array uint8 [0,255] → tensor float [0,255]
+            if input_transform is not None:
+                img_resized = input_transform(img_pil)  # solo Resize, no ToTensor
+            else:
+                img_resized = img_pil  # SW mode: nessun resize, modello gestisce internamente
+            import numpy as _np
+            x = torch.from_numpy(_np.array(img_resized)).permute(2, 0, 1).unsqueeze(0).float().to(device)
+        else:
+            x = input_transform(img_pil).unsqueeze(0).float().to(device)
 
         if args.debug and not _first_image_done:
             print(f"  input tensor: shape={tuple(x.shape)} min={x.min():.4f} max={x.max():.4f}")

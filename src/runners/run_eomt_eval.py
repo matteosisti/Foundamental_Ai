@@ -543,8 +543,14 @@ def main():
                 img_sizes = [img_tensor.shape[-2:]]
 
                 _ac_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+                # Imposta window_size esplicitamente come fa questo gruppo (cell 20):
+                #   model.window_size = target_size[0]  # → 1024
+                # Senza questa riga window_imgs_semantic userebbe img_size di default.
+                if hasattr(model, 'window_size'):
+                    _orig_ws = model.window_size
+                    model.window_size = _lit_img_size[0]
+                    print(f"[SW:LIT] window_size impostata a {_lit_img_size[0]}")
                 # autocast avvolge TUTTO incluso window_imgs_semantic e model.network
-                # esattamente come nel loro semantic_inference
                 with torch.autocast(dtype=_ac_dtype, device_type=device.type):
                     crops_lit, origins_lit = model.window_imgs_semantic(imgs)
                     n_crops = len(crops_lit)

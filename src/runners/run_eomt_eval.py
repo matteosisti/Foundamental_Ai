@@ -595,6 +595,26 @@ def main():
             print(f"[MODEL][v2] --inference-size active: {_v2_img_size} -> {_override}")
             _v2_img_size = _override
 
+        # Auto-detect num_classes and num_q from the checkpoint shapes,
+        # so the runner does not need an explicit --num-classes for the
+        # COCO checkpoint (133) vs Cityscapes (19) vs fine-tuned (19).
+        # The class head has shape [num_classes + 1, embed_dim] (the +1
+        # is the "no-object" logit); the query embedding has shape
+        # [num_q, embed_dim].
+        _det_num_classes = None
+        _det_num_q = None
+        for _ck_k, _ck_v in _ckpt_state.items():
+            if "class_head.weight" in _ck_k and _ck_v.dim() == 2:
+                _det_num_classes = int(_ck_v.shape[0]) - 1
+            if (_ck_k.endswith(".q.weight") or _ck_k.endswith("q.weight")) and _ck_v.dim() == 2:
+                _det_num_q = int(_ck_v.shape[0])
+        if _det_num_classes is not None and _det_num_classes != args.num_classes:
+            print(f"[MODEL][v2] num_classes from checkpoint: {_det_num_classes} "
+                  f"(override of --num-classes={args.num_classes})")
+            args.num_classes = _det_num_classes
+        if _det_num_q is not None:
+            print(f"[MODEL][v2] num_q from checkpoint: {_det_num_q}")
+
         with open(args.config) as _f:
             _cfg = yaml.safe_load(_f)
 
@@ -606,10 +626,18 @@ def main():
         _nc = _cfg["model"]["init_args"]["network"]
         _nm, _nn = _nc["class_path"].rsplit(".", 1)
         _nkw = {k: v for k, v in _nc["init_args"].items()
-                if k not in ("encoder", "num_classes", "masked_attn_enabled")}
+                if k not in ("encoder", "num_classes", "masked_attn_enabled", "num_q")}
+        # If the checkpoint dictates a different num_q from what the config
+        # provides, the checkpoint wins (this is what determines the
+        # query-embedding shape that must match the saved weights).
+        if _det_num_q is not None:
+            _nkw_num_q = _det_num_q
+        else:
+            _nkw_num_q = _nc["init_args"].get("num_q", 100)
         _network = getattr(importlib.import_module(_nm), _nn)(
             masked_attn_enabled=False,
             num_classes=args.num_classes,
+            num_q=_nkw_num_q,
             encoder=_encoder,
             **_nkw,
         )

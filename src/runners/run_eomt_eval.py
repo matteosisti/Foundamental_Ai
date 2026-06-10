@@ -495,9 +495,24 @@ def main():
         # the constructor (panoptic-specific ones in particular).
         _lm, _ln = _cfg["model"]["class_path"].rsplit(".", 1)
         _lkw = {k: v for k, v in _cfg["model"]["init_args"].items() if k != "network"}
-        for _rk in ("stuff_classes", "overlap_thresh", "mask_thresh"):
+
+        # Lift stuff_classes from data.init_args if the model needs it
+        # (panoptic Lightning module).
+        if "stuff_classes" not in _lkw:
+            _data_init = _cfg.get("data", {}).get("init_args", {}) or {}
+            if "stuff_classes" in _data_init:
+                _lkw["stuff_classes"] = _data_init["stuff_classes"]
+
+        for _rk in ("overlap_thresh", "mask_thresh"):
             _lkw.pop(_rk, None)
-        model = getattr(importlib.import_module(_lm), _ln)(
+
+        import inspect as _inspect
+        _cls = getattr(importlib.import_module(_lm), _ln)
+        _sig_params = set(_inspect.signature(_cls.__init__).parameters.keys())
+        if "stuff_classes" in _lkw and "stuff_classes" not in _sig_params:
+            _lkw.pop("stuff_classes", None)
+
+        model = _cls(
             network=_network,
             img_size=_lit_img_size,
             num_classes=args.num_classes,
@@ -600,9 +615,33 @@ def main():
         )
         _lm, _ln = _cfg["model"]["class_path"].rsplit(".", 1)
         _lkw = {k: v for k, v in _cfg["model"]["init_args"].items() if k != "network"}
-        for _rk in ("stuff_classes", "overlap_thresh", "mask_thresh"):
+
+        # The panoptic Lightning module requires `stuff_classes` as a
+        # positional argument in its constructor. In the upstream config
+        # this list lives under `data.init_args.stuff_classes`, not under
+        # `model.init_args`. Lift it into the model kwargs when present so
+        # the panoptic class can be instantiated; the semantic class
+        # ignores any extra kwargs that the runner does not need.
+        if "stuff_classes" not in _lkw:
+            _data_init = _cfg.get("data", {}).get("init_args", {}) or {}
+            if "stuff_classes" in _data_init:
+                _lkw["stuff_classes"] = _data_init["stuff_classes"]
+                print(f"[MODEL][v2] stuff_classes lifted from data.init_args "
+                      f"({len(_lkw['stuff_classes'])} entries)")
+
+        # Drop training-only kwargs that the constructor does not accept.
+        for _rk in ("overlap_thresh", "mask_thresh"):
             _lkw.pop(_rk, None)
-        model = getattr(importlib.import_module(_lm), _ln)(
+
+        # If the target class does NOT accept stuff_classes (e.g. the
+        # semantic class), drop it from kwargs.
+        import inspect as _inspect
+        _cls = getattr(importlib.import_module(_lm), _ln)
+        _sig_params = set(_inspect.signature(_cls.__init__).parameters.keys())
+        if "stuff_classes" in _lkw and "stuff_classes" not in _sig_params:
+            _lkw.pop("stuff_classes", None)
+
+        model = _cls(
             network=_network,
             img_size=_v2_img_size,
             num_classes=args.num_classes,
